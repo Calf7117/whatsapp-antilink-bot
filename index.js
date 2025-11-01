@@ -1,9 +1,9 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 
 const ADMIN_NUMBER = "254106090661";
 const userViolations = new Map();
 
-// Create a proper no-op logger
+// Enhanced silent logger
 const createSilentLogger = () => {
     const noOp = () => {};
     return {
@@ -21,18 +21,28 @@ const createSilentLogger = () => {
 async function connectToWhatsApp() {
     try {
         const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+        const { version, isLatest } = await fetchLatestBaileysVersion();
         
+        console.log(`📱 Using WA v${version.join('.')}, latest: ${isLatest}`);
+
         const sock = makeWASocket({
-            auth: state,
+            version,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, createSilentLogger()),
+            },
             printQRInTerminal: false,
             logger: createSilentLogger(),
             markOnlineOnConnect: false,
             generateHighQualityLinkPreview: false,
-            // Add these to help with decryption issues
+            // Critical: Add these to handle decryption issues
             retryRequestDelayMs: 1000,
-            maxRetries: 5,
-            connectTimeoutMs: 30000,
-            keepAliveIntervalMs: 15000
+            maxRetries: 3,
+            connectTimeoutMs: 20000,
+            keepAliveIntervalMs: 10000,
+            // Handle message decryption more gracefully
+            msgRetryCounterCache: new Map(),
+            getMessage: async () => undefined, // Return undefined if message can't be found
         });
 
         sock.ev.on('connection.update', (update) => {
@@ -40,34 +50,37 @@ async function connectToWhatsApp() {
             
             if (connection === 'open') {
                 console.log('✅ BOT ONLINE - Anti-link protection ACTIVE');
+                console.log(`👑 Admin: ${ADMIN_NUMBER}`);
             }
             
             if (connection === 'close') {
                 const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
-                console.log(`🔄 Connection closed. ${shouldReconnect ? 'Reconnecting...' : 'Authentication failed, please restart.'}`);
+                console.log(`🔌 Connection closed: ${lastDisconnect?.error?.message || 'Unknown reason'}`);
                 if (shouldReconnect) {
+                    console.log('🔄 Reconnecting in 5 seconds...');
                     setTimeout(connectToWhatsApp, 5000);
                 }
             }
             
             if (qr) {
-                console.log('📱 QR Code received - please scan');
+                console.log('⚠️ QR received but using existing auth...');
             }
         });
 
+        // Handle message processing with better error handling
         sock.ev.on('messages.upsert', async (m) => {
             try {
                 const message = m.messages[0];
                 
-                // Skip if no message content or not from group
-                if (!message.message || !message.key?.remoteJid?.includes('@g.us')) {
+                // Skip if no message or not from group
+                if (!message?.message || !message.key?.remoteJid?.includes('@g.us')) {
                     return;
                 }
 
                 const sender = message.key.participant || message.key.remoteJid;
                 const groupJid = message.key.remoteJid;
 
-                // Try multiple ways to extract text - handle decryption issues gracefully
+                // Enhanced text extraction with fallbacks
                 let text = '';
                 try {
                     text = (
@@ -75,62 +88,55 @@ async function connectToWhatsApp() {
                         message.message.extendedTextMessage?.text ||
                         message.message.imageMessage?.caption ||
                         message.message.videoMessage?.caption ||
-                        message.message.documentWithCaptionMessage?.message?.documentMessage?.caption ||
+                        message.message.documentMessage?.caption ||
                         ''
-                    );
+                    ).trim();
                 } catch (extractError) {
-                    console.log('⚠️ Could not extract message text (decryption issue)');
-                    return;
+                    console.log('🔒 Could not extract message text (decryption issue)');
+                    return; // Skip this message if we can't read it
                 }
 
-                // Log ALL messages to see what's coming through
                 console.log(`📨 Message from ${sender}: "${text}"`);
 
-                // BOT STATUS COMMAND - SIMPLIFIED DETECTION
-                if (text && text.trim().toLowerCase() === '!bot') {
-                    console.log('🤖 Bot command detected');
+                // ADMIN DETECTION - Multiple format checks
+                const isAdmin = checkAdmin(sender, ADMIN_NUMBER);
+                
+                if (isAdmin) {
+                    console.log('👑 ADMIN MESSAGE - IGNORING CHECKS');
+                    
+                    // Handle !bot command for admin
+                    if (text && text.toLowerCase().trim() === '!bot') {
+                        console.log('🤖 Bot status command from admin');
+                        try {
+                            await sock.sendMessage(groupJid, {
+                                text: `✅ ANTI-LINK BOT ACTIVE\nAdmin: ${ADMIN_NUMBER}\nStatus: Online with admin privileges`
+                            });
+                        } catch (error) {
+                            console.log('❌ Error sending bot status:', error.message);
+                        }
+                    }
+                    return; // Skip all checks for admin
+                }
+
+                // Handle !bot command for regular users
+                if (text && text.toLowerCase().trim() === '!bot') {
+                    console.log('🤖 Bot status command from user');
                     try {
                         await sock.sendMessage(groupJid, {
-                            text: `✅ ANTI-LINK BOT ACTIVE\nAdmin: ${ADMIN_NUMBER}\nStatus: Online and monitoring for links`
+                            text: `✅ ANTI-LINK BOT ACTIVE\nAdmin: ${ADMIN_NUMBER}\nStatus: Monitoring for links`
                         });
-                        console.log('✅ Bot status sent');
                         return;
                     } catch (error) {
-                        console.log('❌ Error sending bot status:', error.message);
+                        console.log('❌ Error sending status:', error.message);
                     }
                 }
 
-                // If we can't get text due to decryption, skip further processing
-                if (!text || text.trim() === '') {
-                    return;
-                }
+                // Skip empty messages
+                if (!text) return;
 
-                // ADMIN DETECTION
-                const cleanNumber = (num) => num.replace(/\D/g, '').replace(/^0+/, '');
-                const senderClean = cleanNumber(sender);
-                const adminClean = cleanNumber(ADMIN_NUMBER);
+                // IMPROVED LINK DETECTION - Only real URLs
+                const hasLink = detectActualLinks(text);
                 
-                const isAdmin = 
-                    senderClean === adminClean ||
-                    senderClean === adminClean.replace('254', '0') ||
-                    sender.includes(ADMIN_NUMBER) ||
-                    sender.includes(adminClean);
-
-                if (isAdmin) {
-                    console.log('👑 Admin message - skipping check');
-                    return;
-                }
-
-                // SIMPLIFIED LINK DETECTION
-                const hasLink = 
-                    /https?:\/\//.test(text) || 
-                    /www\./.test(text) ||
-                    /\.(com|org|net|ke|co|uk|info|biz|io|app|dev)\b/.test(text) ||
-                    text.includes('.com') || 
-                    text.includes('.org') || 
-                    text.includes('.net') ||
-                    text.includes('.ke');
-
                 const isBusinessPost = 
                     message.message.productMessage !== undefined ||
                     message.message.catalogMessage !== undefined;
@@ -143,27 +149,22 @@ async function connectToWhatsApp() {
                     
                     userViolations.set(userKey, newViolations);
                     
-                    console.log(`🚫 VIOLATION #${newViolations} from ${sender}`);
-                    console.log(`🔗 Link detected: ${text}`);
+                    console.log(`🚫 Violation #${newViolations} from ${sender}`);
+                    console.log(`🔗 Content: ${text}`);
 
                     try {
-                        // DELETE MESSAGE
+                        // Delete message
                         await sock.sendMessage(groupJid, {
                             delete: message.key
                         });
                         console.log('✅ Message deleted');
 
-                        // REMOVE USER AFTER 3 VIOLATIONS
+                        // Remove user after 3 violations
                         if (newViolations >= 3) {
                             try {
                                 await sock.groupParticipantsUpdate(groupJid, [sender], 'remove');
                                 console.log('❌ User removed from group');
                                 userViolations.delete(userKey);
-                                
-                                // Notify admin
-                                await sock.sendMessage(ADMIN_NUMBER + '@s.whatsapp.net', {
-                                    text: `🚨 User removed\nUser: ${sender}\nGroup: ${groupJid}\nViolations: ${newViolations}`
-                                });
                             } catch (removeError) {
                                 console.log('❌ Could not remove user:', removeError.message);
                             }
@@ -173,22 +174,64 @@ async function connectToWhatsApp() {
                     }
                 }
             } catch (error) {
-                console.log('❌ Error processing message:', error.message);
+                console.log('⚠️ Error processing message (will continue):', error.message);
+                // Don't throw, continue processing other messages
             }
         });
 
         sock.ev.on('creds.update', saveCreds);
 
-        // Handle other events that might help with decryption
-        sock.ev.on('chats.set', () => console.log('💬 Chats loaded'));
-        sock.ev.on('contacts.set', () => console.log('👥 Contacts loaded'));
+        // Handle other events that might help
+        sock.ev.on('messages.update', () => {});
+        sock.ev.on('message-receipt.update', () => {});
         
     } catch (error) {
-        console.log('❌ Connection error:', error);
+        console.log('❌ Connection setup error:', error.message);
         setTimeout(connectToWhatsApp, 10000);
     }
 }
 
-// Start bot
-console.log('🚀 Starting Anti-Link Bot...');
-connectToWhatsApp();
+// IMPROVED ADMIN DETECTION
+function checkAdmin(senderJid, adminNumber) {
+    // Extract pure numbers from both
+    const senderNum = senderJid.replace(/\D/g, '');
+    const adminNum = adminNumber.replace(/\D/g, '');
+    
+    // Check multiple possible formats
+    const isAdmin = 
+        senderNum === adminNum ||
+        senderNum === adminNum.replace('254', '') ||
+        senderJid.includes(adminNumber) ||
+        senderJid.includes(adminNum);
+    
+    console.log(`🔍 Admin check - Sender: ${senderNum}, Admin: ${adminNum}, Result: ${isAdmin}`);
+    return isAdmin;
+}
+
+// IMPROVED LINK DETECTION - Only real URLs
+function detectActualLinks(text) {
+    // Only match actual URLs and domains, not random text
+    const linkPatterns = [
+        /https?:\/\/[^\s]+/g,  // http:// or https:// URLs
+        /www\.[^\s]+/g,        // www. domains
+        /[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(\/[^\s]*)?/g, // domain.com/path
+    ];
+    
+    const hasLink = linkPatterns.some(pattern => {
+        const matches = text.match(pattern);
+        if (matches) {
+            console.log(`🔗 Found links:`, matches);
+            return true;
+        }
+        return false;
+    });
+    
+    return hasLink;
+}
+
+// Start with error handling
+console.log('🚀 Starting Anti-Link Bot with existing auth...');
+connectToWhatsApp().catch(error => {
+    console.log('❌ Failed to start:', error);
+    setTimeout(connectToWhatsApp, 15000);
+});
