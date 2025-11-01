@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, delay } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 
 const ADMIN_NUMBER = "254106090661";
@@ -13,10 +13,8 @@ async function connectToWhatsApp() {
     
     sock = makeWASocket({
         auth: state,
-        printQRInTerminal: false,
-        logger: {
-            level: 'error'
-        }
+        printQRInTerminal: false
+        // REMOVED THE BROKEN LOGGER CONFIG
     });
 
     sock.ev.on('connection.update', (update) => {
@@ -55,29 +53,35 @@ async function connectToWhatsApp() {
         if (text.toLowerCase() === '!bot') {
             try {
                 await sock.sendMessage(groupJid, {
-                    text: `✅ ANTI-LINK BOT IS ONLINE\n🔒 Protecting this group from spam links\n📊 Stats: ${userViolations.size} users tracked`
+                    text: `✅ ANTI-LINK BOT IS ONLINE\n🔒 Protecting this group from spam links & business posts\n📊 Stats: ${userViolations.size} users tracked`
                 });
                 console.log('✅ Bot status checked');
             } catch (error) {
-                console.log('Error sending status:', error);
+                console.log('Error sending status:', error.message);
             }
             return;
         }
 
-        // 🔴 ANTI-LINK PROTECTION
+        // 🔴 DETECT LINKS & BUSINESS POSTS
         const isAdmin = sender.includes(ADMIN_NUMBER);
+        
+        // Check for regular links
         const hasLink = text.includes('http://') || text.includes('https://') || 
                        text.includes('.com') || text.includes('.org') || 
                        text.includes('.net') || text.includes('.ke/');
+        
+        // Check for business/catalog messages
+        const isBusinessPost = message.message.productMessage !== undefined ||
+                              message.message.catalogMessage !== undefined;
 
-        if (hasLink && !isAdmin) {
+        if ((hasLink || isBusinessPost) && !isAdmin) {
             const userKey = `${groupJid}-${sender}`;
             const violations = userViolations.get(userKey) || 0;
             const newViolations = violations + 1;
             
             userViolations.set(userKey, newViolations);
             
-            console.log(`🚫 Link violation #${newViolations} from ${sender}`);
+            console.log(`🚫 ${isBusinessPost ? 'BUSINESS POST' : 'LINK'} violation #${newViolations} from ${sender}`);
 
             try {
                 // 🗑️ DELETE MESSAGE FOR EVERYONE
@@ -94,14 +98,12 @@ async function connectToWhatsApp() {
                     console.log('⚠️ Second violation - message deleted');
                 } 
                 else if (newViolations >= 3) {
-                    // 🚫 SILENTLY REMOVE USER FROM GROUP (NO NOTIFICATION)
+                    // 🚫 SILENTLY REMOVE USER FROM GROUP
                     await sock.groupParticipantsUpdate(groupJid, [sender], 'remove');
                     console.log('❌ User silently removed from group for 3+ violations');
                     
                     // Reset violations after removal
                     userViolations.delete(userKey);
-                    
-                    // NO GROUP NOTIFICATION - COMPLETELY SILENT REMOVAL
                 }
             } catch (error) {
                 console.log('❌ Error handling violation:', error.message);
@@ -111,6 +113,19 @@ async function connectToWhatsApp() {
 
     sock.ev.on('creds.update', saveCreds);
 }
+
+// Handle errors to prevent crashes
+process.on('uncaughtException', (error) => {
+    console.log('❌ Uncaught Exception:', error.message);
+    console.log('🔄 Restarting bot in 10 seconds...');
+    setTimeout(connectToWhatsApp, 10000);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.log('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+    console.log('🔄 Restarting bot in 10 seconds...');
+    setTimeout(connectToWhatsApp, 10000);
+});
 
 // Start bot
 console.log('🚀 Starting Anti-Link Bot...');
