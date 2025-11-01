@@ -1,6 +1,6 @@
 const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 
-const ADMIN_NUMBER = "254106090661"; // Your number confirmed from previous code
+const ADMIN_NUMBER = "254106090661";
 const userViolations = new Map();
 
 async function connectToWhatsApp() {
@@ -9,7 +9,7 @@ async function connectToWhatsApp() {
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
-        logger: { level: 'error' }
+        logger: undefined
     });
 
     sock.ev.on('connection.update', (update) => {
@@ -29,7 +29,6 @@ async function connectToWhatsApp() {
         const message = m.messages[0];
         if (!message.message || !message.key.remoteJid.includes('@g.us')) return;
 
-        // Extract message text from all possible sources
         const text = message.message.conversation || 
                     message.message.extendedTextMessage?.text || 
                     message.message.imageMessage?.caption ||
@@ -39,35 +38,31 @@ async function connectToWhatsApp() {
 
         console.log(`📨 Message from ${sender}: ${text}`);
 
-        // 🔧 IMPROVED ADMIN DETECTION
-        const cleanNumber = (num) => num.replace(/\D/g, '').replace(/^0+/, '');
-        const senderClean = cleanNumber(sender);
-        const adminClean = cleanNumber(ADMIN_NUMBER);
-        
-        // Multiple format support for admin detection
-        const isAdmin = 
-            senderClean === adminClean ||
-            senderClean === adminClean.replace('254', '0') || // Kenyan local format
-            sender.includes(ADMIN_NUMBER) ||
-            sender.includes(adminClean);
-
-        console.log(`👑 Admin check: ${senderClean} vs ${adminClean} = ${isAdmin}`);
-
-        // 🟢 BOT STATUS COMMAND - IMPROVED
+        // BOT STATUS COMMAND
         const cleanText = text.trim().toLowerCase();
         if (cleanText === '!bot') {
             try {
                 await sock.sendMessage(groupJid, {
-                    text: `🤖 ANTI-LINK BOT STATUS:\n✅ ONLINE & PROTECTING\n👑 Admin: ${ADMIN_NUMBER}\n🔒 Blocking: Links & Business Posts\n🚫 Rules: 3 violations = removal`
+                    text: `✅ ANTI-LINK BOT ACTIVE\nAdmin: ${ADMIN_NUMBER}`
                 });
-                console.log('✅ Bot status responded');
-                return; // Important: stop processing after command
+                return;
             } catch (error) {
                 console.log('Error sending status:', error.message);
             }
         }
 
-        // 🔴 ANTI-LINK PROTECTION - PRESERVED ALL FUNCTIONS
+        // ADMIN DETECTION
+        const cleanNumber = (num) => num.replace(/\D/g, '').replace(/^0+/, '');
+        const senderClean = cleanNumber(sender);
+        const adminClean = cleanNumber(ADMIN_NUMBER);
+        
+        const isAdmin = 
+            senderClean === adminClean ||
+            senderClean === adminClean.replace('254', '0') ||
+            sender.includes(ADMIN_NUMBER) ||
+            sender.includes(adminClean);
+
+        // ANTI-LINK PROTECTION
         const hasLink = /https?:\/\//.test(text) || 
                        /\.(com|org|net|ke|co|uk|info|biz)\//.test(text) ||
                        text.includes('.com') || text.includes('.org') || 
@@ -76,9 +71,7 @@ async function connectToWhatsApp() {
         const isBusinessPost = message.message.productMessage !== undefined ||
                               message.message.catalogMessage !== undefined;
 
-        console.log(`🔍 Link check: ${hasLink}, Business: ${isBusinessPost}, Admin: ${isAdmin}`);
-
-        // 🚨 ENFORCE RULES (skip if admin)
+        // ENFORCE RULES - SILENT MODE
         if ((hasLink || isBusinessPost) && !isAdmin) {
             const userKey = `${groupJid}-${sender}`;
             const violations = userViolations.get(userKey) || 0;
@@ -86,38 +79,24 @@ async function connectToWhatsApp() {
             
             userViolations.set(userKey, newViolations);
             
-            console.log(`🚫 ${isBusinessPost ? 'BUSINESS POST' : 'LINK'} violation #${newViolations} from ${sender}`);
+            console.log(`🚫 Violation #${newViolations} from ${sender}`);
 
             try {
-                // 🗑️ DELETE MESSAGE FOR EVERYONE
+                // SILENT DELETE - NO WARNING
                 await sock.sendMessage(groupJid, {
                     delete: message.key
                 });
-                console.log('✅ Message deleted');
+                console.log('✅ Message deleted silently');
 
-                // ⚠️ WARN USER ON FIRST VIOLATION
-                if (newViolations === 1) {
-                    await sock.sendMessage(groupJid, {
-                        text: `⚠️ @${sender.split('@')[0]} - Links/business posts are not allowed! (Warning ${newViolations}/3)`,
-                        mentions: [sender]
-                    });
-                }
-
-                // 🚨 PROGRESSIVE PUNISHMENT
+                // SILENT REMOVAL ON 3RD VIOLATION
                 if (newViolations >= 3) {
                     await sock.groupParticipantsUpdate(groupJid, [sender], 'remove');
-                    await sock.sendMessage(groupJid, {
-                        text: `❌ @${sender.split('@')[0]} removed from group due to repeated violations.`,
-                        mentions: [sender]
-                    });
-                    console.log('❌ User removed from group');
+                    console.log('❌ User removed silently');
                     userViolations.delete(userKey);
                 }
             } catch (error) {
                 console.log('❌ Error:', error.message);
             }
-        } else if ((hasLink || isBusinessPost) && isAdmin) {
-            console.log('✅ Admin link allowed - no action taken');
         }
     });
 
@@ -126,5 +105,4 @@ async function connectToWhatsApp() {
 
 // Start bot
 console.log('🚀 Starting Anti-Link Bot...');
-console.log(`👑 Admin Number: ${ADMIN_NUMBER}`);
 connectToWhatsApp();
