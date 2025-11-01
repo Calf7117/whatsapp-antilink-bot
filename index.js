@@ -9,14 +9,18 @@ async function connectToWhatsApp() {
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
-        // FIXED: Use a proper logger configuration
+        // ALTERNATIVE LOGGER CONFIGURATION
         logger: {
-            level: 'silent', // This should prevent the child method error
-            trace: () => {},
-            debug: () => {},
-            info: () => {},
-            warn: () => {},
-            error: () => {}
+            level: 'fatal',
+            child: () => ({
+                level: 'fatal',
+                trace: () => {},
+                debug: () => {},
+                info: () => {},
+                warn: () => {},
+                error: () => {},
+                fatal: () => {}
+            })
         }
     });
 
