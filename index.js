@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
 const fs = require('fs').promises;
 const path = require('path');
@@ -9,19 +9,20 @@ const ADMIN_NUMBER = "254106090661";
 const userViolations = new Map();
 let sock = null;
 let isConnected = false;
+let qrGenerated = false;
 
 async function connectToWhatsApp() {
     try {
-        // Check if auth_info exists and has session files
+        // Check if auth_info exists
         const authDir = './auth_info';
         let hasExistingSession = false;
         
         try {
             const files = await fs.readdir(authDir);
             hasExistingSession = files.some(file => file.includes('creds') || file.includes('app-state'));
-            console.log(hasExistingSession ? '✅ Existing session found' : '❌ No session found');
+            console.log(hasExistingSession ? '✅ Existing session found' : '❌ No session found - will require QR');
         } catch (error) {
-            console.log('❌ Auth directory not accessible');
+            console.log('❌ Auth directory not accessible - will require QR');
         }
 
         const { state, saveCreds } = await useMultiFileAuthState(authDir);
@@ -29,33 +30,47 @@ async function connectToWhatsApp() {
         sock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
-            markOnlineOnConnect: true
+            markOnlineOnConnect: true,
+            // Add connection stability settings
+            connectTimeoutMs: 30000,
+            keepAliveIntervalMs: 15000,
+            // Remove problematic logger
         });
 
         sock.ev.on('connection.update', (update) => {
-            const { connection, qr, isNewLogin } = update;
+            const { connection, qr, lastDisconnect } = update;
             
-            if (qr && !hasExistingSession) {
-                console.log('\n📱 SCAN QR CODE:');
+            if (qr && !qrGenerated) {
+                qrGenerated = true;
+                console.log('\n📱 ONE-TIME QR CODE SCAN REQUIRED:');
+                console.log('1. Open WhatsApp → Linked Devices → Link a Device');
+                console.log('2. Scan this code ONCE:\n');
                 qrcode.generate(qr, { small: true });
-                isConnected = false;
-            } else if (qr && hasExistingSession) {
-                console.log('🔄 Session expired, need new QR scan');
-                console.log('\n📱 SCAN QR CODE:');
-                qrcode.generate(qr, { small: true });
+                console.log('\n✅ After scanning, bot will save session and auto-connect');
                 isConnected = false;
             }
             
             if (connection === 'open') {
                 isConnected = true;
+                qrGenerated = false; // Reset for future use
                 console.log('\n✅ BOT ONLINE - Anti-link & Business Post protection ACTIVE');
-                console.log('📱 Linked Devices should show: ACTIVE NOW');
+                console.log('📱 Check WhatsApp Linked Devices - should show "Active now"');
             }
             
             if (connection === 'close') {
                 isConnected = false;
-                console.log('\n❌ Connection lost - Restarting in 5 seconds...');
-                setTimeout(connectToWhatsApp, 5000);
+                const reason = lastDisconnect?.error?.output?.statusCode;
+                
+                if (reason === DisconnectReason.loggedOut) {
+                    console.log('\n🚫 Session logged out - deleting old session files...');
+                    // Delete old session and restart
+                    setTimeout(() => {
+                        connectToWhatsApp();
+                    }, 5000);
+                } else {
+                    console.log('\n❌ Connection closed - Restarting in 10 seconds...');
+                    setTimeout(connectToWhatsApp, 10000);
+                }
             }
         });
 
@@ -97,7 +112,9 @@ async function connectToWhatsApp() {
             // Check for business/catalog messages
             const isBusinessPost = message.message.productMessage !== undefined ||
                                   message.message.catalogMessage !== undefined ||
-                                  message.message.buttonsMessage !== undefined;
+                                  (message.message.buttonsMessage && 
+                                   message.message.buttonsMessage.contentText && 
+                                   message.message.buttonsMessage.buttons.length > 0);
 
             if ((hasLink || isBusinessPost) && !isAdmin) {
                 const userKey = `${groupJid}-${sender}`;
@@ -140,7 +157,8 @@ async function connectToWhatsApp() {
 
     } catch (error) {
         console.log('❌ Connection error:', error.message);
-        setTimeout(connectToWhatsApp, 5000);
+        console.log('🔄 Restarting in 10 seconds...');
+        setTimeout(connectToWhatsApp, 10000);
     }
 }
 
