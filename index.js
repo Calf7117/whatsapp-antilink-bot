@@ -3,37 +3,44 @@ const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysocket
 const ADMIN_NUMBER = "254106090661";
 const userViolations = new Map();
 
+// Create a proper no-op logger that has all the expected methods
+const createSilentLogger = () => {
+    const noOp = () => {};
+    return {
+        level: 'silent',
+        trace: noOp,
+        debug: noOp,
+        info: noOp,
+        warn: noOp,
+        error: noOp,
+        fatal: noOp,
+        child: () => createSilentLogger()
+    };
+};
+
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
     
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
-        // ALTERNATIVE LOGGER CONFIGURATION
-        logger: {
-            level: 'fatal',
-            child: () => ({
-                level: 'fatal',
-                trace: () => {},
-                debug: () => {},
-                info: () => {},
-                warn: () => {},
-                error: () => {},
-                fatal: () => {}
-            })
-        }
+        // Use the proper silent logger
+        logger: createSilentLogger()
     });
 
     sock.ev.on('connection.update', (update) => {
-        const { connection } = update;
+        const { connection, lastDisconnect } = update;
         
         if (connection === 'open') {
             console.log('✅ BOT ONLINE - Anti-link protection ACTIVE');
         }
         
         if (connection === 'close') {
-            console.log('🔄 Restarting...');
-            setTimeout(connectToWhatsApp, 5000);
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
+            console.log(`🔄 Connection closed. ${shouldReconnect ? 'Reconnecting...' : 'Authentication failed, please restart.'}`);
+            if (shouldReconnect) {
+                setTimeout(connectToWhatsApp, 5000);
+            }
         }
     });
 
@@ -117,4 +124,4 @@ async function connectToWhatsApp() {
 
 // Start bot
 console.log('🚀 Starting Anti-Link Bot...');
-connectToWhatsApp();
+connectToWhatsApp().catch(console.error);
