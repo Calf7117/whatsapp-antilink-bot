@@ -60,7 +60,9 @@ async function isGroupAdmin(sock, groupJid, senderJid) {
   try {
     const meta = await sock.groupMetadata(groupJid);
     if (!meta || !Array.isArray(meta.participants)) return false;
-    const part = meta.participants.find((p) => p.id === senderJid || p.id === senderJid.replace(/\D/g, "") + "@s.whatsapp.net");
+    const part = meta.participants.find(
+      (p) => p.id === senderJid || p.id === senderJid.replace(/\D/g, "") + "@s.whatsapp.net"
+    );
     if (!part) return false;
     return Boolean(part.isAdmin || part.isSuperAdmin);
   } catch (e) {
@@ -111,10 +113,8 @@ function analyzeMessageForViolation(msg) {
   }
 
   // Detect phone numbers only in visible text (9+ digits)
-  // The reason we run this on visibleText is to avoid matching hidden metadata or JIDs.
   const phoneMatches = visibleText.match(PHONE_DIGIT_SEQUENCE);
   if (phoneMatches && phoneMatches.length > 0) {
-    // further heuristics: ignore if the sequence is part of some timestamp-like pattern? (not needed now)
     return { reason: "phone", detail: "9+ digit sequence in visible text" };
   }
 
@@ -135,11 +135,12 @@ function analyzeMessageForViolation(msg) {
 }
 
 async function startBot() {
+  // This preserves session reuse in the "auth_info" directory:
   const { state, saveCreds } = await useMultiFileAuthState("auth_info");
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
-    printQRInTerminal: false,
+    printQRInTerminal: true, // Set to true to see QR the first time; afterwards session will be reused
     auth: state,
     version,
   });
@@ -147,15 +148,25 @@ async function startBot() {
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log("📲 Scan this QR code with WhatsApp to log in.");
+    }
+
     if (connection === "open") {
       console.log("✅ BOT ONLINE - Anti-Link Protection Active");
       console.log(`👑 Owner (exempt): ${ADMIN_NUMBER}`);
     } else if (connection === "close") {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       console.log("🔌 Connection closed:", lastDisconnect?.error?.message || "unknown");
+
       if (shouldReconnect) {
+        console.log("♻️ Reconnecting in 5 seconds...");
         setTimeout(() => startBot().catch(() => {}), 5000);
+      } else {
+        console.log("🚪 Logged out. Delete auth_info folder if you want a fresh login.");
       }
     }
   });
@@ -201,7 +212,7 @@ async function startBot() {
             });
           } else {
             await sock.sendMessage(groupJid, {
-              text: `✅ ANTI-LINK BOT ACTIVE\nStatus: Monitoring for links`,
+              text: `✅ ANTI-LINK BOT ACTIVE\nStatus: Monitoring for links, APKs, phone numbers & business messages`,
             });
           }
         } catch (e) {
@@ -232,7 +243,12 @@ async function startBot() {
       // Silent delete
       try {
         await sock.sendMessage(groupJid, {
-          delete: { remoteJid: groupJid, fromMe: false, id: msg.key.id, participant: senderJid },
+          delete: {
+            remoteJid: groupJid,
+            fromMe: false,
+            id: msg.key.id,
+            participant: senderJid,
+          },
         });
       } catch (delErr) {
         console.log("⚠️ Delete failed:", delErr.message);
