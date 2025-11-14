@@ -1,6 +1,6 @@
-// index.js - Anti-Link Bot (CommonJS)
-// Aggressive mode: delete all links/business/apk/phone numbers except AUTHORIZED admin number
-// Allows !bot for the AUTHORIZED admin and for other group admins
+// index.js - Final Anti-Link Bot (CommonJS)
+// Aggressive mode: delete links/business/apk/phone numbers (9+ digits in visible text)
+// Owner (ADMIN_NUMBER) is the only exempt account. Other admins can use !bot but are not exempt.
 
 const {
   default: makeWASocket,
@@ -12,13 +12,13 @@ const fs = require("fs");
 const path = require("path");
 
 // ---------- CONFIG ----------
-const ADMIN_NUMBER = "254106090661"; // only this number is exempt from deletion (owner)
-const AUTH_DEBUG_LOG_ADMIN_JID = false; // set true to print the owner's exact seen JID once for debugging
+const ADMIN_NUMBER = "254106090661"; // ONLY this number is exempt from enforcement
+const AUTH_DEBUG_LOG_ADMIN_JID = false; // set true once if you want to capture the exact JID seen for owner
 // ----------------------------
 
 const userViolations = new Map();
 
-// clear stale signal cache but keep creds
+// clear stale signal cache but keep creds (helps avoid Bad MAC / decryption errors)
 const keyDir = path.join(__dirname, "auth_info", "signal");
 if (fs.existsSync(keyDir)) {
   try {
@@ -29,20 +29,21 @@ if (fs.existsSync(keyDir)) {
   }
 }
 
-// Aggressive link regex (covers http(s), www, short domains, domain.tld/path, etc.)
-const LINK_REGEX = /\b(?:https?:\/\/|www\.)\S+|\b[A-Za-z0-9.-]+\.[A-Za-z]{2,}(\/\S*)?\b/i;
+// Aggressive link regex: http(s), www, short domains, bare domain.tld/path
+const LINK_REGEX = /\b(?:https?:\/\/|www\.)\S+|\b[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:\/\S*)?\b/i;
 
-// Phone number regex: any sequence of 9 or more digits (word boundary)
-const PHONE_REGEX = /\b\d{9,}\b/;
+// Phone number regex to detect sequences of 9+ digits inside visible text
+const PHONE_DIGIT_SEQUENCE = /\d{9,}/g;
 
-// APK detection regex (in text/links)
+// APK detection
 const APK_REGEX = /\.apk\b/i;
 
-// Helper: strictly check whether a sender matches the configured ADMIN_NUMBER in common JID formats
+// Helper: match owner/admin number robustly across JID formats
 function isOwnerJidMatch(senderJid) {
   if (!senderJid) return false;
   const adminNum = ADMIN_NUMBER.replace(/\D/g, "");
   const senderNum = senderJid.replace(/\D/g, "");
+  // Common JID forms
   const possibleForms = [
     `${adminNum}@s.whatsapp.net`,
     `${adminNum}@whatsapp.net`,
@@ -51,89 +52,86 @@ function isOwnerJidMatch(senderJid) {
     adminNum,
     `+${adminNum}`,
   ];
-  const match =
-    senderNum === adminNum ||
-    possibleForms.includes(senderJid) ||
-    senderJid.includes(adminNum);
-  return match;
+  return senderNum === adminNum || possibleForms.includes(senderJid) || senderJid.includes(adminNum);
 }
 
-// Helper: check if sender is a group admin (super admin or admin) by fetching metadata
+// Helper: check if a sender is admin of the group (to let other admins use !bot)
 async function isGroupAdmin(sock, groupJid, senderJid) {
   try {
     const meta = await sock.groupMetadata(groupJid);
     if (!meta || !Array.isArray(meta.participants)) return false;
-    const part = meta.participants.find((p) => {
-      // participant id might be '254701234567@s.whatsapp.net'
-      return p.id === senderJid || p.id === senderJid.replace(/\D/g, "") + "@s.whatsapp.net";
-    });
+    const part = meta.participants.find((p) => p.id === senderJid || p.id === senderJid.replace(/\D/g, "") + "@s.whatsapp.net");
     if (!part) return false;
     return Boolean(part.isAdmin || part.isSuperAdmin);
   } catch (e) {
-    // on error, assume false (safe default)
+    // safe default
     return false;
   }
 }
 
-// Unified violation checker: checks message object for any violating content
-function analyzeMessageForViolation(msg) {
-  // msg is the raw message object from Baileys
-  let text = "";
+// Extract visible user text safely (only from conversation/extendedText/caption fields)
+function extractVisibleText(msg) {
   try {
-    text =
+    return (
       msg.message.conversation ||
       msg.message.extendedTextMessage?.text ||
       msg.message.imageMessage?.caption ||
       msg.message.videoMessage?.caption ||
       msg.message.documentMessage?.caption ||
-      "";
+      ""
+    ) || "";
   } catch {
-    text = "";
+    return "";
   }
+}
 
-  // business/catalog messages
+// Analyze a message for violation based on visible text and specific message types
+function analyzeMessageForViolation(msg) {
+  // Business/catalog payloads (productMessage/catalogMessage)
   if (msg.message.productMessage !== undefined || msg.message.catalogMessage !== undefined) {
     return { reason: "business_message", detail: "product/catalog message" };
   }
 
-  // documents: check filename or mimetype for APK
+  // Documents: check filename and mimetype for APK
   if (msg.message.documentMessage) {
     const doc = msg.message.documentMessage;
     const fileName = doc.fileName || "";
     const mime = doc.mimetype || "";
-    // APK by name or by Android package mimetype
     if (APK_REGEX.test(fileName) || /application\/vnd\.android\.package-archive/i.test(mime)) {
       return { reason: "apk", detail: "document.apk" };
     }
   }
 
-  // check text for APK (link or caption)
-  if (APK_REGEX.test(text)) {
+  // Visible text checks (phone numbers, text-based APK, links)
+  const visibleText = extractVisibleText(msg);
+
+  // Detect .apk in visible text or links
+  if (APK_REGEX.test(visibleText)) {
     return { reason: "apk", detail: ".apk in text/link" };
   }
 
-  // check phone numbers (9+ digits)
-  if (PHONE_REGEX.test(text)) {
-    return { reason: "phone", detail: "9+ digit sequence" };
+  // Detect phone numbers only in visible text (9+ digits)
+  // The reason we run this on visibleText is to avoid matching hidden metadata or JIDs.
+  const phoneMatches = visibleText.match(PHONE_DIGIT_SEQUENCE);
+  if (phoneMatches && phoneMatches.length > 0) {
+    // further heuristics: ignore if the sequence is part of some timestamp-like pattern? (not needed now)
+    return { reason: "phone", detail: "9+ digit sequence in visible text" };
   }
 
-  // check links aggressively
-  if (LINK_REGEX.test(text)) {
-    return { reason: "link", detail: "detected link pattern" };
+  // Aggressive link detection on visible text
+  if (LINK_REGEX.test(visibleText)) {
+    return { reason: "link", detail: "detected link pattern in visible text" };
   }
 
-  // also check if a message contains a document/url field with externalUrl / url in some message types
-  // e.g., sticker with url? Not all libs populate the same fields; check common ones defensively
+  // Also check contextInfo.externalAdReply (preview-like external links)
   try {
-    // documentMessage?.fileName already checked; also check any 'url' or 'externalAdReply' preview
     const ext = msg.message.extendedTextMessage?.contextInfo?.externalAdReply;
     if (ext && (ext.title || ext.mediaUrl || ext.sourceUrl)) {
-      // treat as link/business
-      return { reason: "link", detail: "externalAdReply" };
+      return { reason: "link", detail: "externalAdReply preview" };
     }
   } catch {}
 
-  return null; // no violation detected
+  return null;
 }
 
 async function startBot() {
@@ -148,15 +146,13 @@ async function startBot() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  // log online/offline
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect } = update;
     if (connection === "open") {
       console.log("✅ BOT ONLINE - Anti-Link Protection Active");
       console.log(`👑 Owner (exempt): ${ADMIN_NUMBER}`);
     } else if (connection === "close") {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       console.log("🔌 Connection closed:", lastDisconnect?.error?.message || "unknown");
       if (shouldReconnect) {
         setTimeout(() => startBot().catch(() => {}), 5000);
@@ -164,7 +160,7 @@ async function startBot() {
     }
   });
 
-  // one-time debug print: exact JID as seen for owner (helps tune matching). Controlled by flag.
+  // Optional single-shot owner JID debug (controlled by flag)
   let ownerJidLogged = false;
 
   sock.ev.on("messages.upsert", async (m) => {
@@ -172,42 +168,28 @@ async function startBot() {
       const msg = m.messages[0];
       if (!msg) return;
       if (!msg.message || !msg.key?.remoteJid) return;
-      if (msg.key.fromMe) return; // ignore messages from the bot itself
-      if (!msg.key.remoteJid.includes("@g.us")) return; // only handle group messages
+      if (msg.key.fromMe) return; // ignore bot's own messages
+      if (!msg.key.remoteJid.includes("@g.us")) return; // only run in groups
 
       const groupJid = msg.key.remoteJid;
-      const senderJid = msg.key.participant || msg.key.remoteJid; // participant present in groups
+      const senderJid = msg.key.participant || msg.key.remoteJid;
 
-      // optional debug: log exact sender JID once if it's owner
+      // Optional debug: log exact owner JID once
       if (AUTH_DEBUG_LOG_ADMIN_JID && !ownerJidLogged && isOwnerJidMatch(senderJid)) {
         console.log("🔎 Seen owner JID as:", senderJid);
         ownerJidLogged = true;
       }
 
-      // Determine roles for !bot handling
+      // Determine roles for !bot behavior
       const ownerIsSender = isOwnerJidMatch(senderJid);
       const senderIsGroupAdmin = await isGroupAdmin(sock, groupJid, senderJid).catch(() => false);
 
-      // Extract text safely for command check
-      let text = "";
-      try {
-        text =
-          msg.message.conversation ||
-          msg.message.extendedTextMessage?.text ||
-          msg.message.imageMessage?.caption ||
-          msg.message.videoMessage?.caption ||
-          msg.message.documentMessage?.caption ||
-          "";
-      } catch {
-        text = "";
-      }
-      const textTrim = (text || "").trim();
+      // Extract visible text for commands and checks
+      const visibleText = extractVisibleText(msg).trim();
+      const textLower = visibleText.toLowerCase();
 
-      // !bot handling:
-      // Owner (ADMIN_NUMBER) gets admin-style response.
-      // Other group admins get admin-ish response.
-      // Regular users get monitoring message.
-      if (textTrim.toLowerCase() === "!bot") {
+      // !bot command handling:
+      if (textLower === "!bot") {
         try {
           if (ownerIsSender) {
             await sock.sendMessage(groupJid, {
@@ -225,20 +207,19 @@ async function startBot() {
         } catch (e) {
           console.log("⚠️ Could not send !bot reply:", e.message);
         }
-        return; // don't enforce deletion on the !bot message itself
+        return; // do not enforce deletion on the !bot message itself
       }
 
-      // Now check for violations (links, phone numbers, apk, business/catalog)
+      // Analyze for violations (uses only visible text for phone/link/apk checks)
       const violation = analyzeMessageForViolation(msg);
-      if (!violation) return; // nothing to do
+      if (!violation) return;
 
-      // If sender is the owner (ADMIN_NUMBER), exempt them fully (no delete, no strike)
+      // Exempt the owner number entirely
       if (ownerIsSender) {
-        // Owner is exempt from enforcement. No action.
         return;
       }
 
-      // Otherwise enforce: delete message silently, increment strike, remove on 3rd strike
+      // Enforce: silent delete + strike + remove at 3
       const userKey = `${groupJid}-${senderJid}`;
       const current = userViolations.get(userKey) || 0;
       const updated = current + 1;
@@ -248,8 +229,8 @@ async function startBot() {
         `🚫 Violation #${updated} → ${senderJid} | group:${groupJid} | reason:${violation.reason} (${violation.detail})`
       );
 
+      // Silent delete
       try {
-        // Silent delete
         await sock.sendMessage(groupJid, {
           delete: { remoteJid: groupJid, fromMe: false, id: msg.key.id, participant: senderJid },
         });
@@ -274,7 +255,7 @@ async function startBot() {
 }
 
 // start
-console.log("🚀 Starting Anti-Link Bot (aggressive mode) using stored session...");
+console.log("🚀 Starting Anti-Link Bot (final aggressive mode) using stored session...");
 startBot().catch((e) => {
   console.log("❌ Startup error:", e.message);
   setTimeout(() => startBot().catch(() => {}), 10000);
