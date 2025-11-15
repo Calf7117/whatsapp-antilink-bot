@@ -1,6 +1,7 @@
-// index.js - Final Anti-Link Bot (CommonJS)
-// Aggressive mode: delete links/business/apk/phone numbers (9+ digits in visible text)
-// Owner (ADMIN_NUMBER) is the only exempt account. Other admins can use !bot but are not exempt.
+// index.js - Anti-Link Bot (CommonJS)
+// Deletes links / APKs / phone numbers / business messages in groups
+// 3-strike rule: delete 1st & 2nd, delete + remove user on 3rd (silent).
+// Only ADMIN_NUMBER is exempt. Admins (including owner) can use !bot.
 
 const {
   default: makeWASocket,
@@ -13,7 +14,7 @@ const path = require("path");
 
 // ---------- CONFIG ----------
 const ADMIN_NUMBER = "254106090661"; // ONLY this number is exempt from enforcement
-const AUTH_DEBUG_LOG_ADMIN_JID = false; // set true once if you want to capture the exact JID seen for owner
+const AUTH_DEBUG_LOG_ADMIN_JID = false; // set true once to log the exact JID seen for owner
 // ----------------------------
 
 const userViolations = new Map();
@@ -43,7 +44,6 @@ function isOwnerJidMatch(senderJid) {
   if (!senderJid) return false;
   const adminNum = ADMIN_NUMBER.replace(/\D/g, "");
   const senderNum = senderJid.replace(/\D/g, "");
-  // Common JID forms
   const possibleForms = [
     `${adminNum}@s.whatsapp.net`,
     `${adminNum}@whatsapp.net`,
@@ -65,8 +65,7 @@ async function isGroupAdmin(sock, groupJid, senderJid) {
     );
     if (!part) return false;
     return Boolean(part.isAdmin || part.isSuperAdmin);
-  } catch (e) {
-    // safe default
+  } catch {
     return false;
   }
 }
@@ -89,6 +88,8 @@ function extractVisibleText(msg) {
 
 // Analyze a message for violation based on visible text and specific message types
 function analyzeMessageForViolation(msg) {
+  if (!msg.message) return null;
+
   // Business/catalog payloads (productMessage/catalogMessage)
   if (msg.message.productMessage !== undefined || msg.message.catalogMessage !== undefined) {
     return { reason: "business_message", detail: "product/catalog message" };
@@ -106,6 +107,11 @@ function analyzeMessageForViolation(msg) {
 
   // Visible text checks (phone numbers, text-based APK, links)
   const visibleText = extractVisibleText(msg);
+
+  if (!visibleText) {
+    // without visible text, and no product/doc-apk above, nothing to enforce
+    return null;
+  }
 
   // Detect .apk in visible text or links
   if (APK_REGEX.test(visibleText)) {
@@ -129,7 +135,9 @@ function analyzeMessageForViolation(msg) {
     if (ext && (ext.title || ext.mediaUrl || ext.sourceUrl)) {
       return { reason: "link", detail: "externalAdReply preview" };
     }
-  } catch {}
+  } catch {
+    // ignore
+  }
 
   return null;
 }
@@ -140,7 +148,7 @@ async function startBot() {
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
-    printQRInTerminal: true, // Set to true to see QR the first time; afterwards session will be reused
+    printQRInTerminal: true, // you only scan once; afterward "auth_info" is reused
     auth: state,
     version,
   });
@@ -171,18 +179,21 @@ async function startBot() {
     }
   });
 
-  // Optional single-shot owner JID debug (controlled by flag)
   let ownerJidLogged = false;
 
   sock.ev.on("messages.upsert", async (m) => {
     try {
+      if (!m.messages || !m.messages[0]) return;
+
       const msg = m.messages[0];
-      if (!msg) return;
-      if (!msg.message || !msg.key?.remoteJid) return;
+
+      // Basic guards
+      if (!msg.message || !msg.key || !msg.key.remoteJid) return;
       if (msg.key.fromMe) return; // ignore bot's own messages
-      if (!msg.key.remoteJid.includes("@g.us")) return; // only run in groups
 
       const groupJid = msg.key.remoteJid;
+      if (!groupJid.endsWith("@g.us")) return; // only groups
+
       const senderJid = msg.key.participant || msg.key.remoteJid;
 
       // Optional debug: log exact owner JID once
@@ -191,15 +202,14 @@ async function startBot() {
         ownerJidLogged = true;
       }
 
-      // Determine roles for !bot behavior
       const ownerIsSender = isOwnerJidMatch(senderJid);
       const senderIsGroupAdmin = await isGroupAdmin(sock, groupJid, senderJid).catch(() => false);
 
-      // Extract visible text for commands and checks
+      // Visible text for commands and content checks
       const visibleText = extractVisibleText(msg).trim();
       const textLower = visibleText.toLowerCase();
 
-      // !bot command handling:
+      // Handle !bot command first, and never delete that message
       if (textLower === "!bot") {
         try {
           if (ownerIsSender) {
@@ -218,19 +228,22 @@ async function startBot() {
         } catch (e) {
           console.log("⚠️ Could not send !bot reply:", e.message);
         }
-        return; // do not enforce deletion on the !bot message itself
+        return; // IMPORTANT: don't process this further (no deletion)
       }
 
-      // Analyze for violations (uses only visible text for phone/link/apk checks)
+      // Now analyze for violations
       const violation = analyzeMessageForViolation(msg);
-      if (!violation) return;
+      if (!violation) {
+        // No link/apk/phone/business found -> do nothing
+        return;
+      }
 
-      // Exempt the owner number entirely
+      // Owner is always exempt from enforcement
       if (ownerIsSender) {
         return;
       }
 
-      // Enforce: silent delete + strike + remove at 3
+      // Strike tracking per user per group
       const userKey = `${groupJid}-${senderJid}`;
       const current = userViolations.get(userKey) || 0;
       const updated = current + 1;
@@ -240,13 +253,14 @@ async function startBot() {
         `🚫 Violation #${updated} → ${senderJid} | group:${groupJid} | reason:${violation.reason} (${violation.detail})`
       );
 
-      // Silent delete
+      // Silent delete of THIS exact message
       try {
         await sock.sendMessage(groupJid, {
           delete: {
             remoteJid: groupJid,
-            fromMe: false,
             id: msg.key.id,
+            fromMe: false,
+            // participant is required when deleting messages from groups that are not sent by the bot
             participant: senderJid,
           },
         });
@@ -254,7 +268,7 @@ async function startBot() {
         console.log("⚠️ Delete failed:", delErr.message);
       }
 
-      // Remove on 3rd strike
+      // Remove user on 3rd strike
       if (updated >= 3) {
         try {
           await sock.groupParticipantsUpdate(groupJid, [senderJid], "remove");
@@ -271,7 +285,7 @@ async function startBot() {
 }
 
 // start
-console.log("🚀 Starting Anti-Link Bot (final aggressive mode) using stored session...");
+console.log("🚀 Starting Anti-Link Bot (aggressive mode) using stored session...");
 startBot().catch((e) => {
   console.log("❌ Startup error:", e.message);
   setTimeout(() => startBot().catch(() => {}), 10000);
