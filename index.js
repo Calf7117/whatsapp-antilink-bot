@@ -1,292 +1,189 @@
-// index.js - Anti-Link Bot (CommonJS)
-// Deletes links / APKs / phone numbers / business messages in groups
-// 3-strike rule: delete 1st & 2nd, delete + remove user on 3rd (silent).
-// Only ADMIN_NUMBER is exempt. Admins (including owner) can use !bot.
-
 const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-} = require("@whiskeysockets/baileys");
-const fs = require("fs");
-const path = require("path");
+} = require("@whiskeysockets/baileys")
 
-// ---------- CONFIG ----------
-const ADMIN_NUMBER = "254106090661"; // ONLY this number is exempt from enforcement
-const AUTH_DEBUG_LOG_ADMIN_JID = false; // set true once to log the exact JID seen for owner
-// ----------------------------
+const fs = require("fs")
+const path = require("path")
 
-const userViolations = new Map();
+// Protected admin number
+const ADMIN_NUMBER = "254106090661"
 
-// clear stale signal cache but keep creds (helps avoid Bad MAC / decryption errors)
-const keyDir = path.join(__dirname, "auth_info", "signal");
-if (fs.existsSync(keyDir)) {
-  try {
-    fs.rmSync(keyDir, { recursive: true, force: true });
-    console.log("🧹 Cleared stale signal key cache");
-  } catch (e) {
-    console.log("⚠️ Could not clear signal cache:", e.message);
-  }
+// Track violations
+const userViolations = new Map()
+
+// Clean signal cache
+const signalDir = path.join(__dirname, "auth_info", "signal")
+if (fs.existsSync(signalDir)) {
+  fs.rmSync(signalDir, { recursive: true, force: true })
+  console.log("🧹 Cleared expired signal keys")
 }
 
-// Aggressive link regex: http(s), www, short domains, bare domain.tld/path
-const LINK_REGEX = /\b(?:https?:\/\/|www\.)\S+|\b[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:\/\S*)?\b/i;
+// ---------------------------------------------
+//               DETECTION RULES
+// ---------------------------------------------
 
-// Phone number regex to detect sequences of 9+ digits inside visible text
-const PHONE_DIGIT_SEQUENCE = /\d{9,}/g;
+// Detect real URLs only
+function detectLinks(text) {
+  if (!text) return false
 
-// APK detection
-const APK_REGEX = /\.apk\b/i;
+  const patterns = [
+    /https?:\/\/[^\s]+/gi,
+    /www\.[^\s]+/gi,
+    /\b([a-zA-Z0-9-]+\.)+[a-z]{2,}\b/gi,
+  ]
 
-// Helper: match owner/admin number robustly across JID formats
-function isOwnerJidMatch(senderJid) {
-  if (!senderJid) return false;
-  const adminNum = ADMIN_NUMBER.replace(/\D/g, "");
-  const senderNum = senderJid.replace(/\D/g, "");
-  const possibleForms = [
-    `${adminNum}@s.whatsapp.net`,
-    `${adminNum}@whatsapp.net`,
-    `${adminNum}@c.us`,
-    `${adminNum}@g.us`,
-    adminNum,
-    `+${adminNum}`,
-  ];
-  return senderNum === adminNum || possibleForms.includes(senderJid) || senderJid.includes(adminNum);
+  return patterns.some((reg) => reg.test(text))
 }
 
-// Helper: check if a sender is admin of the group (to let other admins use !bot)
-async function isGroupAdmin(sock, groupJid, senderJid) {
-  try {
-    const meta = await sock.groupMetadata(groupJid);
-    if (!meta || !Array.isArray(meta.participants)) return false;
-    const part = meta.participants.find(
-      (p) => p.id === senderJid || p.id === senderJid.replace(/\D/g, "") + "@s.whatsapp.net"
-    );
-    if (!part) return false;
-    return Boolean(part.isAdmin || part.isSuperAdmin);
-  } catch {
-    return false;
-  }
+// Detect phone numbers 9+ digits
+function detectPhoneNumbers(text) {
+  if (!text) return false
+  return /\d{9,}/.test(text)
 }
 
-// Extract visible user text safely (only from conversation/extendedText/caption fields)
-function extractVisibleText(msg) {
-  try {
-    return (
+// Detect real business messages
+function isBusinessPost(msg) {
+  return (
+    msg.message?.productMessage !== undefined ||
+    msg.message?.catalogMessage !== undefined
+  )
+}
+
+// Detect real APK files ONLY
+function isAPKFile(msg) {
+  return (
+    msg.message?.documentMessage?.mimetype ===
+    "application/vnd.android.package-archive"
+  )
+}
+
+// Protected admin check
+function isAdmin(senderJid) {
+  const senderNum = senderJid.replace(/\D/g, "")
+  const adminNum = ADMIN_NUMBER.replace(/\D/g, "")
+  return senderNum.endsWith(adminNum)
+}
+
+// ---------------------------------------------
+//              START BOT
+// ---------------------------------------------
+async function startBot() {
+  const { state, saveCreds } = await useMultiFileAuthState("auth_info")
+  const { version } = await fetchLatestBaileysVersion()
+
+  const sock = makeWASocket({
+    printQRInTerminal: false,
+    auth: state,
+    version,
+  })
+
+  sock.ev.on("creds.update", saveCreds)
+
+  sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
+    if (connection === "open") {
+      console.log("✅ BOT ONLINE")
+      console.log(`👑 Protected Admin: ${ADMIN_NUMBER}`)
+    }
+
+    if (connection === "close") {
+      const shouldReconnect =
+        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
+      if (shouldReconnect) startBot()
+    }
+  })
+
+  // ---------------------------------------------
+  //              MESSAGE HANDLING
+  // ---------------------------------------------
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    const msg = messages[0]
+    if (!msg.message || !msg.key.remoteJid) return
+
+    const groupJid = msg.key.remoteJid
+    const sender = msg.key.participant || msg.key.remoteJid
+
+    const text =
       msg.message.conversation ||
       msg.message.extendedTextMessage?.text ||
       msg.message.imageMessage?.caption ||
       msg.message.videoMessage?.caption ||
       msg.message.documentMessage?.caption ||
       ""
-    ) || "";
-  } catch {
-    return "";
-  }
-}
 
-// Analyze a message for violation based on visible text and specific message types
-function analyzeMessageForViolation(msg) {
-  if (!msg.message) return null;
+    const admin = isAdmin(sender)
 
-  // Business/catalog payloads (productMessage/catalogMessage)
-  if (msg.message.productMessage !== undefined || msg.message.catalogMessage !== undefined) {
-    return { reason: "business_message", detail: "product/catalog message" };
-  }
+    // --- BOT STATUS COMMAND ---
+    if (text.trim().toLowerCase() === "!bot") {
+      const reply = admin
+        ? `✅ Anti-Link Bot Active\nProtected Admin: ${ADMIN_NUMBER}\nStatus: Full privileges enabled.`
+        : `✅ Anti-Link Bot Active\nProtected Admin: ${ADMIN_NUMBER}\nStatus: Monitoring messages.`
 
-  // Documents: check filename and mimetype for APK
-  if (msg.message.documentMessage) {
-    const doc = msg.message.documentMessage;
-    const fileName = doc.fileName || "";
-    const mime = doc.mimetype || "";
-    if (APK_REGEX.test(fileName) || /application\/vnd\.android\.package-archive/i.test(mime)) {
-      return { reason: "apk", detail: "document.apk" };
-    }
-  }
-
-  // Visible text checks (phone numbers, text-based APK, links)
-  const visibleText = extractVisibleText(msg);
-
-  if (!visibleText) {
-    // without visible text, and no product/doc-apk above, nothing to enforce
-    return null;
-  }
-
-  // Detect .apk in visible text or links
-  if (APK_REGEX.test(visibleText)) {
-    return { reason: "apk", detail: ".apk in text/link" };
-  }
-
-  // Detect phone numbers only in visible text (9+ digits)
-  const phoneMatches = visibleText.match(PHONE_DIGIT_SEQUENCE);
-  if (phoneMatches && phoneMatches.length > 0) {
-    return { reason: "phone", detail: "9+ digit sequence in visible text" };
-  }
-
-  // Aggressive link detection on visible text
-  if (LINK_REGEX.test(visibleText)) {
-    return { reason: "link", detail: "detected link pattern in visible text" };
-  }
-
-  // Also check contextInfo.externalAdReply (preview-like external links)
-  try {
-    const ext = msg.message.extendedTextMessage?.contextInfo?.externalAdReply;
-    if (ext && (ext.title || ext.mediaUrl || ext.sourceUrl)) {
-      return { reason: "link", detail: "externalAdReply preview" };
-    }
-  } catch {
-    // ignore
-  }
-
-  return null;
-}
-
-async function startBot() {
-  // This preserves session reuse in the "auth_info" directory:
-  const { state, saveCreds } = await useMultiFileAuthState("auth_info");
-  const { version } = await fetchLatestBaileysVersion();
-
-  const sock = makeWASocket({
-    printQRInTerminal: true, // you only scan once; afterward "auth_info" is reused
-    auth: state,
-    version,
-  });
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      console.log("📲 Scan this QR code with WhatsApp to log in.");
+      await sock.sendMessage(groupJid, { text: reply })
+      return
     }
 
-    if (connection === "open") {
-      console.log("✅ BOT ONLINE - Anti-Link Protection Active");
-      console.log(`👑 Owner (exempt): ${ADMIN_NUMBER}`);
-    } else if (connection === "close") {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log("🔌 Connection closed:", lastDisconnect?.error?.message || "unknown");
+    // Skip ALL protection rules for YOU
+    if (admin) return
 
-      if (shouldReconnect) {
-        console.log("♻️ Reconnecting in 5 seconds...");
-        setTimeout(() => startBot().catch(() => {}), 5000);
-      } else {
-        console.log("🚪 Logged out. Delete auth_info folder if you want a fresh login.");
-      }
-    }
-  });
+    // --- DETECT VIOLATIONS ---
+    const hasLink = detectLinks(text)
+    const hasPhone = detectPhoneNumbers(text)
+    const business = isBusinessPost(msg)
+    const hasAPK = isAPKFile(msg)
 
-  let ownerJidLogged = false;
+    if (hasLink || hasPhone || business || hasAPK) {
+      const key = `${groupJid}-${sender}`
+      const count = userViolations.get(key) || 0
+      const newCount = count + 1
+      userViolations.set(key, newCount)
 
-  sock.ev.on("messages.upsert", async (m) => {
-    try {
-      if (!m.messages || !m.messages[0]) return;
-
-      const msg = m.messages[0];
-
-      // Basic guards
-      if (!msg.message || !msg.key || !msg.key.remoteJid) return;
-      if (msg.key.fromMe) return; // ignore bot's own messages
-
-      const groupJid = msg.key.remoteJid;
-      if (!groupJid.endsWith("@g.us")) return; // only groups
-
-      const senderJid = msg.key.participant || msg.key.remoteJid;
-
-      // Optional debug: log exact owner JID once
-      if (AUTH_DEBUG_LOG_ADMIN_JID && !ownerJidLogged && isOwnerJidMatch(senderJid)) {
-        console.log("🔎 Seen owner JID as:", senderJid);
-        ownerJidLogged = true;
-      }
-
-      const ownerIsSender = isOwnerJidMatch(senderJid);
-      const senderIsGroupAdmin = await isGroupAdmin(sock, groupJid, senderJid).catch(() => false);
-
-      // Visible text for commands and content checks
-      const visibleText = extractVisibleText(msg).trim();
-      const textLower = visibleText.toLowerCase();
-
-      // Handle !bot command first, and never delete that message
-      if (textLower === "!bot") {
-        try {
-          if (ownerIsSender) {
-            await sock.sendMessage(groupJid, {
-              text: `✅ ANTI-LINK BOT ACTIVE\nOwner (exempt): ${ADMIN_NUMBER}\nStatus: Online (owner privileges)`,
-            });
-          } else if (senderIsGroupAdmin) {
-            await sock.sendMessage(groupJid, {
-              text: `✅ ANTI-LINK BOT ACTIVE\nStatus: Online (group admin)`,
-            });
-          } else {
-            await sock.sendMessage(groupJid, {
-              text: `✅ ANTI-LINK BOT ACTIVE\nStatus: Monitoring for links, APKs, phone numbers & business messages`,
-            });
-          }
-        } catch (e) {
-          console.log("⚠️ Could not send !bot reply:", e.message);
-        }
-        return; // IMPORTANT: don't process this further (no deletion)
-      }
-
-      // Now analyze for violations
-      const violation = analyzeMessageForViolation(msg);
-      if (!violation) {
-        // No link/apk/phone/business found -> do nothing
-        return;
-      }
-
-      // Owner is always exempt from enforcement
-      if (ownerIsSender) {
-        return;
-      }
-
-      // Strike tracking per user per group
-      const userKey = `${groupJid}-${senderJid}`;
-      const current = userViolations.get(userKey) || 0;
-      const updated = current + 1;
-      userViolations.set(userKey, updated);
-
+      console.log(`🚫 Violation #${newCount} by ${sender}`)
       console.log(
-        `🚫 Violation #${updated} → ${senderJid} | group:${groupJid} | reason:${violation.reason} (${violation.detail})`
-      );
+        `🔍 Reason: ${
+          hasLink
+            ? "Link"
+            : hasPhone
+            ? "Phone Number"
+            : hasAPK
+            ? "APK File"
+            : "Business Post"
+        }`
+      )
+      console.log(`📨 Text: ${text}`)
 
-      // Silent delete of THIS exact message
+      // Delete message
       try {
         await sock.sendMessage(groupJid, {
           delete: {
             remoteJid: groupJid,
             id: msg.key.id,
+            participant: sender,
             fromMe: false,
-            // participant is required when deleting messages from groups that are not sent by the bot
-            participant: senderJid,
           },
-        });
-      } catch (delErr) {
-        console.log("⚠️ Delete failed:", delErr.message);
+        })
+      } catch (err) {
+        console.log("⚠️ Delete error:", err.message)
       }
 
-      // Remove user on 3rd strike
-      if (updated >= 3) {
+      // Kick after 3 violations
+      if (newCount >= 3) {
         try {
-          await sock.groupParticipantsUpdate(groupJid, [senderJid], "remove");
-          userViolations.delete(userKey);
-          console.log(`❌ Removed ${senderJid} from ${groupJid} after ${updated} violations`);
-        } catch (remErr) {
-          console.log("⚠️ Could not remove user:", remErr.message);
+          await sock.groupParticipantsUpdate(groupJid, [sender], "remove")
+          console.log(`❌ Removed ${sender} from group`)
+          userViolations.delete(key)
+        } catch (err) {
+          console.log("⚠️ Kick error:", err.message)
         }
       }
-    } catch (err) {
-      console.log("⚠️ Error processing message:", err.message);
     }
-  });
+  })
 }
 
-// start
-console.log("🚀 Starting Anti-Link Bot (aggressive mode) using stored session...");
-startBot().catch((e) => {
-  console.log("❌ Startup error:", e.message);
-  setTimeout(() => startBot().catch(() => {}), 10000);
-});
+console.log("🚀 Starting bot using saved session...")
+startBot().catch((err) => {
+  console.log("❌ Startup Error:", err.message)
+  setTimeout(startBot, 5000)
+})
