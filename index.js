@@ -8,51 +8,35 @@ const {
 const fs = require("fs")
 const path = require("path")
 
-// Protected admin number
+// Your admin number only
 const ADMIN_NUMBER = "254106090661"
 
 // Track violations
 const userViolations = new Map()
 
-// Clean signal cache
-const signalDir = path.join(__dirname, "auth_info", "signal")
-if (fs.existsSync(signalDir)) {
-  fs.rmSync(signalDir, { recursive: true, force: true })
-  console.log("🧹 Cleared expired signal keys")
+// Clean signal cache (not creds)
+const keyDir = path.join(__dirname, "auth_info", "signal")
+if (fs.existsSync(keyDir)) {
+  fs.rmSync(keyDir, { recursive: true, force: true })
+  console.log("🧹 Cleared stale signal key cache")
 }
 
-// ---------------------------------------------
-//               DETECTION RULES
-// ---------------------------------------------
-
-// Detect real URLs only
+// Detect URLs
 function detectLinks(text) {
-  if (!text) return false
-
   const patterns = [
     /https?:\/\/[^\s]+/gi,
     /www\.[^\s]+/gi,
-    /\b([a-zA-Z0-9-]+\.)+[a-z]{2,}\b/gi,
+    /[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(\/[^\s]*)?/gi,
   ]
-
-  return patterns.some((reg) => reg.test(text))
+  return patterns.some((p) => text.match(p))
 }
 
-// Detect phone numbers 9+ digits
+// Phone numbers: strings of 9 digits or more
 function detectPhoneNumbers(text) {
-  if (!text) return false
   return /\d{9,}/.test(text)
 }
 
-// Detect real business messages
-function isBusinessPost(msg) {
-  return (
-    msg.message?.productMessage !== undefined ||
-    msg.message?.catalogMessage !== undefined
-  )
-}
-
-// Detect real APK files ONLY
+// Real APK file check by MIME type
 function isAPKFile(msg) {
   return (
     msg.message?.documentMessage?.mimetype ===
@@ -60,16 +44,48 @@ function isAPKFile(msg) {
   )
 }
 
-// Protected admin check
-function isAdmin(senderJid) {
-  const senderNum = senderJid.replace(/\D/g, "")
-  const adminNum = ADMIN_NUMBER.replace(/\D/g, "")
-  return senderNum.endsWith(adminNum)
+// **Correct Business Detection (No false positives)**
+function isBusinessPost(msg) {
+  const p = msg.message?.productMessage
+  const c = msg.message?.catalogMessage
+
+  if (!p && !c) return false
+
+  if (p) {
+    const prod = p.product || {}
+    if (
+      prod.productImage ||
+      prod.title ||
+      prod.description ||
+      prod.currency ||
+      prod.priceAmount1000
+    ) {
+      return true
+    }
+  }
+
+  if (c) {
+    const cat = c.catalog || {}
+    if (cat.title || (cat.products && cat.products.length > 0)) {
+      return true
+    }
+  }
+
+  return false
 }
 
-// ---------------------------------------------
-//              START BOT
-// ---------------------------------------------
+// Check specific admin number + all group admins
+function checkAdmin(senderJid, groupAdmins) {
+  const pureSender = senderJid.replace(/\D/g, "")
+  const pureAdmin = ADMIN_NUMBER.replace(/\D/g, "")
+
+  if (pureSender === pureAdmin) return true
+  if (groupAdmins.includes(senderJid)) return true
+
+  return false
+}
+
+// Start bot
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState("auth_info")
   const { version } = await fetchLatestBaileysVersion()
@@ -82,10 +98,12 @@ async function startBot() {
 
   sock.ev.on("creds.update", saveCreds)
 
-  sock.ev.on("connection.update", ({ connection, lastDisconnect }) => {
+  sock.ev.on("connection.update", (update) => {
+    const { connection, lastDisconnect } = update
+
     if (connection === "open") {
-      console.log("✅ BOT ONLINE")
-      console.log(`👑 Protected Admin: ${ADMIN_NUMBER}`)
+      console.log("✅ BOT ONLINE - Anti-Link Protection Active")
+      console.log(`👑 Admin: ${ADMIN_NUMBER}`)
     }
 
     if (connection === "close") {
@@ -95,16 +113,15 @@ async function startBot() {
     }
   })
 
-  // ---------------------------------------------
-  //              MESSAGE HANDLING
-  // ---------------------------------------------
+  // Core message handler
   sock.ev.on("messages.upsert", async ({ messages }) => {
     const msg = messages[0]
-    if (!msg.message || !msg.key.remoteJid) return
+    if (!msg.message || !msg.key.remoteJid || msg.key.fromMe) return
 
-    const groupJid = msg.key.remoteJid
+    const jid = msg.key.remoteJid
     const sender = msg.key.participant || msg.key.remoteJid
 
+    // Extract text safely
     const text =
       msg.message.conversation ||
       msg.message.extendedTextMessage?.text ||
@@ -113,77 +130,77 @@ async function startBot() {
       msg.message.documentMessage?.caption ||
       ""
 
-    const admin = isAdmin(sender)
+    // Fetch group metadata so we know admins
+    let groupAdmins = []
+    try {
+      const meta = await sock.groupMetadata(jid)
+      groupAdmins = meta.participants
+        .filter((p) => p.admin === "admin" || p.admin === "superadmin")
+        .map((p) => p.id)
+    } catch (e) {}
 
-    // --- BOT STATUS COMMAND ---
-    if (text.trim().toLowerCase() === "!bot") {
-      const reply = admin
-        ? `✅ Anti-Link Bot Active\nProtected Admin: ${ADMIN_NUMBER}\nStatus: Full privileges enabled.`
-        : `✅ Anti-Link Bot Active\nProtected Admin: ${ADMIN_NUMBER}\nStatus: Monitoring messages.`
+    const isAdmin = checkAdmin(sender, groupAdmins)
 
-      await sock.sendMessage(groupJid, { text: reply })
+    // Allow admin full control
+    if (isAdmin) {
+      if (text.trim().toLowerCase() === "!bot") {
+        await sock.sendMessage(jid, {
+          text: `✅ Anti-Link Bot Active\nAdmin: ${ADMIN_NUMBER}\nStatus: Running normally.`,
+        })
+      }
       return
     }
 
-    // Skip ALL protection rules for YOU
-    if (admin) return
+    // Normal users checking status
+    if (text.trim().toLowerCase() === "!bot") {
+      await sock.sendMessage(jid, {
+        text: `🛡 Anti-Link Bot Active\nAdmin: ${ADMIN_NUMBER}\nMonitoring for violations.`,
+      })
+      return
+    }
 
-    // --- DETECT VIOLATIONS ---
+    // Final violation detection
     const hasLink = detectLinks(text)
     const hasPhone = detectPhoneNumbers(text)
     const business = isBusinessPost(msg)
-    const hasAPK = isAPKFile(msg)
+    const apk = isAPKFile(msg)
 
-    if (hasLink || hasPhone || business || hasAPK) {
-      const key = `${groupJid}-${sender}`
+    if (hasLink || hasPhone || business || apk) {
+      const key = `${jid}-${sender}`
       const count = userViolations.get(key) || 0
       const newCount = count + 1
       userViolations.set(key, newCount)
 
-      console.log(`🚫 Violation #${newCount} by ${sender}`)
-      console.log(
-        `🔍 Reason: ${
-          hasLink
-            ? "Link"
-            : hasPhone
-            ? "Phone Number"
-            : hasAPK
-            ? "APK File"
-            : "Business Post"
-        }`
-      )
-      console.log(`📨 Text: ${text}`)
+      console.log(`🚫 Violation #${newCount} from ${sender}`)
+      console.log(`Reason: ${hasLink ? "Link " : ""}${hasPhone ? "Phone " : ""}${business ? "Business " : ""}${apk ? "APK " : ""}`)
+      console.log(`Text: "${text}"`)
 
-      // Delete message
       try {
-        await sock.sendMessage(groupJid, {
+        // Delete violating message
+        await sock.sendMessage(jid, {
           delete: {
-            remoteJid: groupJid,
+            remoteJid: jid,
+            fromMe: false,
             id: msg.key.id,
             participant: sender,
-            fromMe: false,
           },
         })
-      } catch (err) {
-        console.log("⚠️ Delete error:", err.message)
-      }
 
-      // Kick after 3 violations
-      if (newCount >= 3) {
-        try {
-          await sock.groupParticipantsUpdate(groupJid, [sender], "remove")
-          console.log(`❌ Removed ${sender} from group`)
+        // Kick on 3rd violation
+        if (newCount >= 3) {
+          await sock.groupParticipantsUpdate(jid, [sender], "remove")
           userViolations.delete(key)
-        } catch (err) {
-          console.log("⚠️ Kick error:", err.message)
+          console.log(`❌ ${sender} removed from group.`)
         }
+      } catch (err) {
+        console.log("⚠️ Enforcement error:", err.message)
       }
     }
   })
 }
 
-console.log("🚀 Starting bot using saved session...")
+console.log("🚀 Starting Anti-Link Bot using stored session...")
 startBot().catch((err) => {
-  console.log("❌ Startup Error:", err.message)
-  setTimeout(startBot, 5000)
+  console.log("❌ Startup error:", err.message)
+  setTimeout(startBot, 10000)
 })
