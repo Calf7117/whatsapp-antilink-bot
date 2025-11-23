@@ -99,7 +99,7 @@ const KEYWORDS = [
   "child","rape","free","price","payment","rupees","rupee","rs",
   "offer","discount","deal","promo","promotion","sell","selling",
   "buy","order","wholesale","cheap","delivery","inbox","mpesa",
-  "ksh","kes","usd","call"
+  "ksh","kes","usd","call","business"
 ];
 // prepare regex: \b(?:word1|word2|...)\b
 const KEYWORDS_REGEX = new RegExp("\\b(?:" + KEYWORDS.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")\\b", "i");
