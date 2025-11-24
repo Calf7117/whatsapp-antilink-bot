@@ -1,12 +1,14 @@
-// index.js - Final stable Anti-Link Bot (CommonJS)
+// index.js - Performance-optimized Anti-Link Bot with message queue
 // - All requested rules: links, phone numbers, APK (MIME), real business posts, keyword blocking (whole words)
 // - Owner exempt (ADMIN_NUMBER). Other admins can use !bot but are not exempt.
 // - Stability: cached key store, no auth_info/signal wipe, getMessage fallback, backoff
+// - Performance fixes: message queue to prevent missing messages, better error recovery
 // - Fixes in this version:
 //   * Detect violations even when content is forwarded / quoted
 //   * Block messages that contain clickable buttons (treated same as links)
 //   * Block contact messages (including forwarded contacts)
 //   * Delete for everyone (revoke) not just sender
+//   * Message queue processing to catch all messages even under load
 
 const {
   default: makeWASocket,
@@ -25,6 +27,8 @@ const AUTH_DEBUG_LOG_ADMIN_JID = false; // set true once to log exact owner JID 
 // ----------------------------
 
 const userViolations = new Map();
+const messageQueue = []; // Message queue for processing
+let isProcessing = false; // Processing flag
 
 // NOTE: Do NOT delete auth_info/signal here. Preserving signal keys reduces Bad MACs.
 if (!fs.existsSync(path.join(__dirname, "auth_info"))) {
@@ -316,11 +320,28 @@ async function startBot() {
     // One-time debug printing of owner JID if requested
     let ownerJidLogged = false;
 
-    // Message handler
-    sock.ev.on("messages.upsert", async (m) => {
-      const msg = m.messages?.[0];
-      if (!msg) return;
+    // Process message queue sequentially
+    async function processMessageQueue() {
+      if (isProcessing || messageQueue.length === 0) return;
+      
+      isProcessing = true;
+      
+      while (messageQueue.length > 0) {
+        const { msg, sock } = messageQueue.shift();
+        try {
+          await handleMessage(msg, sock);
+        } catch (error) {
+          console.log("⚠️ Error processing queued message:", error.message);
+        }
+        // Small delay between messages to prevent overload
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      
+      isProcessing = false;
+    }
 
+    // Main message handler function
+    async function handleMessage(msg, sock) {
       try {
         // Only handle decrypted, group messages not from the bot itself
         if (!msg.key?.remoteJid || !msg.key.remoteJid.includes("@g.us") || msg.key.fromMe) return;
@@ -429,7 +450,32 @@ async function startBot() {
         // catch-all to avoid crashing message loop
         console.log("⚠️ Error processing message:", procErr.message);
       }
+    }
+
+    // Message handler - adds messages to queue
+    sock.ev.on("messages.upsert", async (m) => {
+      // Handle all messages in the batch
+      const messages = m.messages || [];
+      
+      for (const msg of messages) {
+        if (!msg) continue;
+        
+        // Add to queue for processing
+        messageQueue.push({ msg, sock });
+      }
+      
+      // Start processing if not already running
+      processMessageQueue();
     });
+    
+    // Process queue periodically to catch any missed messages
+    setInterval(() => {
+      if (messageQueue.length > 0) {
+        console.log(`📬 Processing ${messageQueue.length} queued messages...`);
+        processMessageQueue();
+      }
+    }, 5000);
+    
   } catch (startupErr) {
     console.log("❌ Startup error:", startupErr.message);
     setTimeout(() => startBot().catch(() => {}), 10000);
