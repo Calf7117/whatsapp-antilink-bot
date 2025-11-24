@@ -5,6 +5,8 @@
 // - Fixes in this version:
 //   * Detect violations even when content is forwarded / quoted
 //   * Block messages that contain clickable buttons (treated same as links)
+//   * Block contact messages (including forwarded contacts)
+//   * Delete for everyone (revoke) not just sender
 
 const {
   default: makeWASocket,
@@ -237,6 +239,28 @@ function hasButtons(msg) {
   return !!(m.buttonsMessage || m.templateMessage || m.listMessage || m.interactiveMessage);
 }
 
+// Detect contact messages (including forwarded contacts)
+function isContactMessage(msg) {
+  const m = msg.message || {};
+  // Check for direct contact messages
+  if (m.contactMessage) return true;
+  
+  // Check for array of contacts
+  if (m.contactsArrayMessage) return true;
+  
+  // Check for forwarded/quoted contacts
+  const quoted = m.extendedTextMessage?.contextInfo?.quotedMessage;
+  if (quoted?.contactMessage || quoted?.contactsArrayMessage) return true;
+  
+  // Check inside view-once wrappers
+  const vo = m.viewOnceMessage?.message || 
+             m.viewOnceMessageV2?.message ||
+             m.viewOnceMessageV2Extension?.message;
+  if (vo?.contactMessage || vo?.contactsArrayMessage) return true;
+  
+  return false;
+}
+
 // ------------------ Bot startup ------------------
 async function startBot() {
   try {
@@ -358,9 +382,10 @@ async function startBot() {
         const business = isBusinessPost(msg);
         const apk = isAPKFile(msg);
         const keyword = detectKeyword(visibleText);
-        const buttons = hasButtons(msg); // NEW: treat any clickable button as violation
+        const buttons = hasButtons(msg);
+        const contact = isContactMessage(msg); // NEW: block contact messages
 
-        if (hasLink || hasPhone || business || apk || keyword || buttons) {
+        if (hasLink || hasPhone || business || apk || keyword || buttons || contact) {
           const reasonParts = [];
           if (hasLink) reasonParts.push("link");
           if (hasPhone) reasonParts.push("phone");
@@ -368,6 +393,7 @@ async function startBot() {
           if (apk) reasonParts.push("apk");
           if (keyword) reasonParts.push("keyword");
           if (buttons) reasonParts.push("buttons");
+          if (contact) reasonParts.push("contact");
 
           const userKey = `${groupJid}-${senderJid}`;
           const current = userViolations.get(userKey) || 0;
@@ -379,10 +405,10 @@ async function startBot() {
           );
           console.log(`📨 VisibleText: "${visibleText}"`);
 
-          // Silent delete
+          // Delete for everyone (revoke)
           try {
             await sock.sendMessage(groupJid, {
-              delete: { remoteJid: groupJid, fromMe: false, id: msg.key.id, participant: senderJid },
+              delete: msg.key // Use the original message key to revoke for everyone
             });
           } catch (delErr) {
             console.log("⚠️ Delete failed:", delErr.message);
