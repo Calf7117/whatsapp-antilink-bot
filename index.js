@@ -2,6 +2,9 @@
 // - All requested rules: links, phone numbers, APK (MIME), real business posts, keyword blocking (whole words)
 // - Owner exempt (ADMIN_NUMBER). Other admins can use !bot but are not exempt.
 // - Stability: cached key store, no auth_info/signal wipe, getMessage fallback, backoff
+// - Fixes in this version:
+//   * Detect violations even when content is forwarded / quoted
+//   * Block messages that contain clickable buttons (treated same as links)
 
 const {
   default: makeWASocket,
@@ -102,7 +105,7 @@ const KEYWORDS = [
   "ksh","kes","usd","call","business","contact","message"
 ];
 // prepare regex: \b(?:word1|word2|...)\b
-const KEYWORDS_REGEX = new RegExp("\\b(?:" + KEYWORDS.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")\\b", "i");
+const KEYWORDS_REGEX = new RegExp("\\b(?:" + KEYWORDS.map(w => w.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")).join("|") + ")\\b", "i");
 
 function detectKeyword(text) {
   if (!text) return false;
@@ -124,20 +127,114 @@ function isOwnerJidMatch(senderJid) {
   return senderNum === adminNum || possibleForms.includes(senderJid) || senderJid.includes(adminNum);
 }
 
-// Extract visible text safely (only from user-facing fields)
+// -------- Extended text extraction (handles forwarded + buttons) --------
+
+// Extract textual content from a raw message-content object (no wrapper)
+function extractTextFromContent(content) {
+  if (!content || typeof content !== "object") return "";
+
+  const texts = [];
+  const push = (t) => {
+    if (t && typeof t === "string") texts.push(t);
+  };
+
+  // Basic visible text / captions
+  push(content.conversation);
+  push(content.extendedTextMessage?.text);
+  push(content.imageMessage?.caption);
+  push(content.videoMessage?.caption);
+  push(content.documentMessage?.caption);
+
+  // Classic buttonsMessage
+  const bm = content.buttonsMessage;
+  if (bm) {
+    push(bm.contentText);
+    push(bm.footerText);
+    push(bm.headerText);
+    (bm.buttons || []).forEach((b) => {
+      push(b.buttonText?.displayText);
+    });
+  }
+
+  // Template / hydrated buttons
+  const tmpl = content.templateMessage?.hydratedTemplate;
+  if (tmpl) {
+    push(tmpl.hydratedContentText);
+    push(tmpl.hydratedFooterText);
+    push(tmpl.hydratedTitleText);
+    (tmpl.hydratedButtons || []).forEach((btn) => {
+      if (!btn) return;
+      if (btn.quickReplyButton) push(btn.quickReplyButton.displayText);
+      if (btn.urlButton) {
+        push(btn.urlButton.displayText);
+        push(btn.urlButton.url); // scan underlying URL too
+      }
+      if (btn.callButton) push(btn.callButton.displayText);
+    });
+  }
+
+  // List messages
+  const list = content.listMessage;
+  if (list) {
+    push(list.title);
+    push(list.description);
+    push(list.footerText);
+    push(list.text);
+    (list.sections || []).forEach((sec) => {
+      (sec.rows || []).forEach((row) => {
+        push(row.title);
+        push(row.description);
+      });
+    });
+  }
+
+  // Interactive message (newer button/list system)
+  const im = content.interactiveMessage;
+  if (im) {
+    push(im.body?.text);
+    push(im.footer?.text);
+    push(im.header?.title);
+  }
+
+  // External ad reply (catalog / wa.me etc., often from forwards or buttons)
+  const ext = content.extendedTextMessage?.contextInfo?.externalAdReply;
+  if (ext) {
+    push(ext.title);
+    push(ext.body);
+    push(ext.mediaUrl);
+    push(ext.sourceUrl);
+  }
+
+  // Forwarded / quoted original content
+  const quoted = content.extendedTextMessage?.contextInfo?.quotedMessage;
+  if (quoted && typeof quoted === "object") {
+    push(extractTextFromContent(quoted));
+  }
+
+  // View-once wrappers: unwrap and read inner content
+  const vo = content.viewOnceMessage?.message ||
+             content.viewOnceMessageV2?.message ||
+             content.viewOnceMessageV2Extension?.message;
+  if (vo) {
+    push(extractTextFromContent(vo));
+  }
+
+  return texts.join(" ").trim();
+}
+
+// Public helper used by the bot logic
 function extractVisibleText(msg) {
   try {
-    return (
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      msg.message.imageMessage?.caption ||
-      msg.message.videoMessage?.caption ||
-      msg.message.documentMessage?.caption ||
-      ""
-    ) || "";
+    return extractTextFromContent(msg.message || {}) || "";
   } catch {
     return "";
   }
+}
+
+// Detect if a message contains any clickable button structure
+function hasButtons(msg) {
+  const m = msg.message || {};
+  return !!(m.buttonsMessage || m.templateMessage || m.listMessage || m.interactiveMessage);
 }
 
 // ------------------ Bot startup ------------------
@@ -230,7 +327,7 @@ async function startBot() {
         const ownerIsSender = isOwnerJidMatch(senderJid);
         const senderIsAdmin = groupAdmins.includes(senderJid);
 
-        // Extract visible text
+        // Extract visible text (now includes forwarded and button text)
         const visibleText = extractVisibleText(msg).trim();
         const textLower = visibleText.toLowerCase();
 
@@ -261,14 +358,16 @@ async function startBot() {
         const business = isBusinessPost(msg);
         const apk = isAPKFile(msg);
         const keyword = detectKeyword(visibleText);
+        const buttons = hasButtons(msg); // NEW: treat any clickable button as violation
 
-        if (hasLink || hasPhone || business || apk || keyword) {
+        if (hasLink || hasPhone || business || apk || keyword || buttons) {
           const reasonParts = [];
           if (hasLink) reasonParts.push("link");
           if (hasPhone) reasonParts.push("phone");
           if (business) reasonParts.push("business");
           if (apk) reasonParts.push("apk");
           if (keyword) reasonParts.push("keyword");
+          if (buttons) reasonParts.push("buttons");
 
           const userKey = `${groupJid}-${senderJid}`;
           const current = userViolations.get(userKey) || 0;
