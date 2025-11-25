@@ -30,6 +30,10 @@ const userViolations = new Map();
 const messageQueue = []; // Message queue for processing
 let isProcessing = false; // Processing flag
 
+// Track removed users to prevent re-adding by non-owners
+// Key: `${groupJid}-${removedUserJid}`, Value: { removedBy: ownerJid, timestamp: Date.now() }
+const removedUsers = new Map();
+
 // NOTE: Do NOT delete auth_info/signal here. Preserving signal keys reduces Bad MACs.
 if (!fs.existsSync(path.join(__dirname, "auth_info"))) {
   console.log("⚠️ auth_info not found — ensure your session files are in ./auth_info");
@@ -265,6 +269,34 @@ function isContactMessage(msg) {
   return false;
 }
 
+// Check if a user was recently removed by bot or admin (within last 24 hours)
+function wasRecentlyRemoved(groupJid, userJid) {
+  const key = `${groupJid}-${userJid}`;
+  const removedData = removedUsers.get(key);
+  
+  if (!removedData) return false;
+  
+  // Remove entries older than 24 hours
+  const now = Date.now();
+  const maxAge = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+  
+  if (now - removedData.timestamp > maxAge) {
+    removedUsers.delete(key);
+    return false;
+  }
+  
+  return true;
+}
+
+// Track when bot removes users
+async function trackRemovedUser(groupJid, removedUserJid, removedByJid) {
+  const key = `${groupJid}-${removedUserJid}`;
+  removedUsers.set(key, {
+    removedBy: removedByJid,
+    timestamp: Date.now()
+  });
+}
+
 // ------------------ Bot startup ------------------
 async function startBot() {
   try {
@@ -439,6 +471,7 @@ async function startBot() {
           if (updated >= 3) {
             try {
               await sock.groupParticipantsUpdate(groupJid, [senderJid], "remove");
+              await trackRemovedUser(groupJid, senderJid, groupJid); // Track removal (bot as remover)
               userViolations.delete(userKey);
               console.log(`❌ Removed ${senderJid} from ${groupJid} after ${updated} violations`);
             } catch (remErr) {
@@ -475,6 +508,96 @@ async function startBot() {
         processMessageQueue();
       }
     }, 5000);
+    
+    // Monitor group participant updates to prevent re-adding removed users (manual adds)
+    sock.ev.on("groups.update", async (updates) => {
+      for (const update of updates) {
+        if (update.participants) {
+          for (const participant of update.participants) {
+            try {
+              // Check if this is a join event (participant joined)
+              if (participant.action === "add") {
+                const addedUserJid = participant.id;
+                const groupJid = update.id;
+                
+                // Check if this user was recently removed
+                if (wasRecentlyRemoved(groupJid, addedUserJid)) {
+                  console.log(`🚫 Preventing re-add of ${addedUserJid} to ${groupJid} - user was recently removed`);
+                  
+                  // Try to identify who added them
+                  let addedByOwner = false;
+                  try {
+                    const meta = await sock.groupMetadata(groupJid);
+                    const lastMessage = meta.lastMsg; // This might not be available, but worth trying
+                  } catch (e) {
+                    // ignore metadata errors
+                  }
+                  
+                  // Remove the user immediately
+                  await sock.groupParticipantsUpdate(groupJid, [addedUserJid], "remove");
+                  
+                  // Log the action
+                  console.log(`❌ Re-removed ${addedUserJid} from ${groupJid} - only owner can add back`);
+                  
+                  // Send warning message to group
+                  try {
+                    await sock.sendMessage(groupJid, {
+                      text: `⚠️ This user was recently removed and can only be added back by the group owner (${ADMIN_NUMBER}).`
+                    });
+                  } catch (msgErr) {
+                    console.log("⚠️ Could not send re-add warning:", msgErr.message);
+                  }
+                }
+              }
+            } catch (err) {
+              console.log("⚠️ Error checking participant update:", err.message);
+            }
+          }
+        }
+      }
+    });
+    
+    // Also monitor membership changes to catch link joins and other join methods
+    setInterval(async () => {
+      try {
+        // Get all groups where bot is participant
+        const groups = await sock.groupFetchAllParticipating();
+        
+        for (const group of Object.values(groups)) {
+          const groupJid = group.id;
+          if (!group.participants) continue;
+          
+          // Check each participant in the group
+          for (const participant of group.participants) {
+            const userJid = participant.id;
+            
+            // Skip if it's the bot itself or if user is still in the group but was previously removed
+            if (userJid === sock.user?.id) continue;
+            
+            // Check if this user was recently removed but is somehow back in the group
+            if (wasRecentlyRemoved(groupJid, userJid)) {
+              console.log(`🚫 Found re-joined user ${userJid} in ${groupJid} - removing via membership check`);
+              
+              try {
+                // Remove the user
+                await sock.groupParticipantsUpdate(groupJid, [userJid], "remove");
+                console.log(`❌ Re-removed ${userJid} from ${groupJid} (link join prevention)`);
+                
+                // Send warning message to group
+                await sock.sendMessage(groupJid, {
+                  text: `⚠️ This user was recently removed and can only be added back by the group owner (${ADMIN_NUMBER}).`
+                });
+              } catch (remErr) {
+                console.log("⚠️ Could not remove re-joined user:", remErr.message);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        // Silently ignore membership check errors
+        console.log("⚠️ Membership check error:", err.message);
+      }
+    }, 30000); // Check every 30 seconds
     
   } catch (startupErr) {
     console.log("❌ Startup error:", startupErr.message);
