@@ -1,6 +1,6 @@
-// index.js - Anti-Link Bot v2.5
-// FIXED: !bot works for owner, Delete for EVERYONE (not just sender)
-// Processes ALL groups - handles delete failures gracefully
+// index.js - Anti-Link Bot v2.6
+// FIXED: !bot command works for owner, Delete for EVERYONE
+// Key fix: !bot check is BEFORE fromMe filter so owner can use it
 
 const {
   default: makeWASocket,
@@ -18,10 +18,7 @@ const ADMIN_NUMBER = "254106090661"; // Owner - fully exempt from all rules
 const DEBUG_MODE = true;             // Set true for verbose logging
 // ----------------------------
 
-// Violations tracking
 const userViolations = new Map();
-
-// Message queue
 const messageQueue = [];
 let isProcessing = false;
 
@@ -267,15 +264,17 @@ async function startBot() {
       if (connection === "open") {
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║     ✅ ANTI-LINK BOT v2.5 ONLINE        ║");
+        console.log("║     ✅ ANTI-LINK BOT v2.6 ONLINE        ║");
         console.log("╠══════════════════════════════════════════╣");
         console.log("║  🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
         console.log("║  👑 Owner: " + ADMIN_NUMBER.padEnd(29) + "║");
         console.log("║  📋 Mode: All groups (try & catch)       ║");
+        console.log("║  🔧 !bot now works for owner            ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
-        console.log("Bot will process ALL groups and handle errors gracefully.");
-        console.log("Messages are deleted for EVERYONE in the group.");
+        console.log("✅ Bot will process ALL groups.");
+        console.log("✅ Messages deleted for EVERYONE (not just sender).");
+        console.log("✅ Owner can use !bot command.");
         console.log("");
       }
 
@@ -305,8 +304,6 @@ async function startBot() {
       }
 
       try {
-        // Delete for everyone - requires the full message key
-        // The key must include: remoteJid, id, fromMe, participant
         await sock.sendMessage(groupJid, { delete: msgKey });
         return true;
       } catch (e) {
@@ -350,7 +347,6 @@ async function startBot() {
     async function handleMessage(msg) {
       try {
         if (!msg?.key?.remoteJid?.endsWith("@g.us")) return;
-        if (msg.key.fromMe) return;
         if (!msg.message) return;
 
         const groupJid = msg.key.remoteJid;
@@ -359,12 +355,12 @@ async function startBot() {
         const visibleText = extractVisibleText(msg).trim();
         const textLower = visibleText.toLowerCase();
 
-        // Check for !bot command FIRST (before owner exemption)
+        // ✅ CHECK FOR !bot COMMAND FIRST (BEFORE fromMe FILTER)
         if (textLower === "!bot") {
           console.log("📨 !bot command from:", senderJid);
           const ownerCheck = isOwner(senderJid);
           try {
-            let responseText = "✅ ANTI-LINK BOT v2.5 ACTIVE\n";
+            let responseText = "✅ ANTI-LINK BOT v2.6 ACTIVE\n";
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
             responseText += "📋 Monitoring this group\n";
             if (ownerCheck) {
@@ -378,7 +374,10 @@ async function startBot() {
           return;
         }
 
-        // Owner is ALWAYS exempt from violations (but can still use !bot)
+        // ✅ NOW SKIP IF MESSAGE IS FROM BOT ITSELF (AFTER !bot check)
+        if (msg.key.fromMe) return;
+
+        // Owner is ALWAYS exempt from violations
         if (isOwner(senderJid)) {
           if (DEBUG_MODE) console.log("👑 Owner message - exempt from rules");
           return;
@@ -421,7 +420,6 @@ async function startBot() {
         console.log("   Reason: " + reasons.join(", "));
         console.log("   Strike: " + updated + "/3");
         console.log("   Text: " + visibleText.substring(0, 100));
-        console.log("   MsgKey:", JSON.stringify(msg.key));
 
         // Try to delete message for EVERYONE
         const deleted = await safeDelete(groupJid, msg.key);
@@ -477,10 +475,9 @@ async function startBot() {
       
       for (const msg of messages) {
         if (!msg?.key?.remoteJid?.endsWith("@g.us")) continue;
-        if (msg.key.fromMe) continue;
         if (!msg.message) continue;
         
-        if (DEBUG_MODE) {
+        if (DEBUG_MODE && !msg.key.fromMe) {
           console.log("📩 New message in:", msg.key.remoteJid.substring(0, 20) + "...");
         }
         
