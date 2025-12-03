@@ -1,4 +1,4 @@
-// index.js - Anti-Link Bot v2.6
+// index.js - Anti-Link Bot v2.5
 // FIXED: !bot command works for owner, Delete for EVERYONE
 // Key fix: !bot check is BEFORE fromMe filter so owner can use it
 
@@ -264,12 +264,12 @@ async function startBot() {
       if (connection === "open") {
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║     ✅ ANTI-LINK BOT v2.6 ONLINE        ║");
+        console.log("║     ✅ ANTI-LINK BOT v2.5 ONLINE        ║");
         console.log("╠══════════════════════════════════════════╣");
         console.log("║  🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
         console.log("║  👑 Owner: " + ADMIN_NUMBER.padEnd(29) + "║");
         console.log("║  📋 Mode: All groups (try & catch)       ║");
-        console.log("║  🔧 !bot now works for owner            ║");
+        console.log("║  🔧 !bot now works for owner, Baby!           ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
         console.log("✅ Bot will process ALL groups.");
@@ -360,7 +360,7 @@ async function startBot() {
           console.log("📨 !bot command from:", senderJid);
           const ownerCheck = isOwner(senderJid);
           try {
-            let responseText = "✅ ANTI-LINK BOT v2.6 ACTIVE\n";
+            let responseText = "✅ ANTI-LINK BOT v2.5 ACTIVE, Baby!\n";
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
             responseText += "📋 Monitoring this group\n";
             if (ownerCheck) {
