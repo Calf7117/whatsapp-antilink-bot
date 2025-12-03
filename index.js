@@ -1,12 +1,11 @@
-// index.js - Anti-Link Bot v2.1
-// FIXED: Now properly checks if BOT is admin in groups
+// index.js - Anti-Link Bot v2.2
+// FIXED: Better JID matching for new WhatsApp format
 // 
-// Key changes:
-// - Checks if BOT (not owner) is admin - bot needs admin rights to delete messages
-// - Scans groups on startup to show which ones bot can manage
-// - Better debugging to see what's happening
-// - Spam/duplicate message detection
-// - Rate limiting protection
+// Key changes in v2.2:
+// - Fixed JID normalization to handle 254106090661:9@s.whatsapp.net format
+// - Extracts phone number from any JID format for comparison
+// - Shows detailed debug info during group scan
+// - Works in groups where the bot's phone number is admin
 
 const {
   default: makeWASocket,
@@ -28,6 +27,7 @@ const userViolations = new Map();
 const messageQueue = [];
 let isProcessing = false;
 let botJid = null; // Bot's own JID
+let botPhoneNumber = null; // Just the phone number extracted from bot JID
 
 // Cache for group admin status
 const groupCache = new Map();
@@ -53,6 +53,18 @@ const createSilentLogger = () => {
     child: () => createSilentLogger(),
   };
 };
+
+// Extract just the phone number from any JID format
+// Handles: 254106090661:9@s.whatsapp.net, 254106090661@s.whatsapp.net, 116775916175567@lid, etc.
+function extractPhoneNumber(jid) {
+  if (!jid) return null;
+  // Remove @s.whatsapp.net, @c.us, @lid, @g.us etc
+  let clean = jid.split("@")[0];
+  // Remove :0, :9, etc suffix
+  clean = clean.split(":")[0];
+  // Return just digits
+  return clean.replace(/\D/g, "");
+}
 
 // ------------------ Detection Helpers ------------------
 
@@ -112,13 +124,14 @@ function detectKeyword(text) {
 
 function isOwnerJidMatch(senderJid) {
   if (!senderJid) return false;
-  const adminNum = ADMIN_NUMBER.replace(/\D/g, "");
-  const senderNum = senderJid.replace(/\D/g, "");
+  const senderPhone = extractPhoneNumber(senderJid);
   
-  if (senderNum === adminNum || senderJid.includes(adminNum)) {
+  // Check if sender is owner
+  if (senderPhone === ADMIN_NUMBER) {
     return true;
   }
-  if (botJid && senderJid === botJid) {
+  // Check if sender is bot itself
+  if (botPhoneNumber && senderPhone === botPhoneNumber) {
     return true;
   }
   return false;
@@ -275,8 +288,10 @@ async function startBot() {
       const { connection, lastDisconnect, qr } = update;
       if (connection === "open") {
         botJid = sock.user?.id;
+        botPhoneNumber = extractPhoneNumber(botJid);
         console.log("✅ BOT ONLINE - Stable");
         console.log(`🤖 Bot JID: ${botJid}`);
+        console.log(`📱 Bot Phone: ${botPhoneNumber}`);
         console.log(`👑 Owner (exempt): ${ADMIN_NUMBER}`);
         console.log("📋 Monitoring groups where BOT is admin");
         
@@ -340,19 +355,15 @@ async function startBot() {
         for (const p of meta.participants) {
           const isAdmin = p.admin === "admin" || p.admin === "superadmin";
           
-          // Check if this participant is the bot
-          if (botJid) {
-            // Compare normalized JIDs
-            const pNormalized = p.id.split(":")[0].split("@")[0];
-            const botNormalized = botJid.split(":")[0].split("@")[0];
-            
-            if (pNormalized === botNormalized || p.id === botJid) {
-              botIsAdmin = isAdmin;
-              if (DEBUG_MODE && isAdmin) {
-                console.log(`🔍 Found bot as admin: ${p.id}`);
-              }
-              break;
+          // Check if this participant is the bot using phone number extraction
+          const participantPhone = extractPhoneNumber(p.id);
+          
+          if (participantPhone === botPhoneNumber || participantPhone === ADMIN_NUMBER) {
+            botIsAdmin = isAdmin;
+            if (DEBUG_MODE) {
+              console.log(`🔍 Found bot in group: ${p.id} (phone: ${participantPhone}) admin: ${isAdmin}`);
             }
+            if (isAdmin) break; // Found bot as admin, no need to continue
           }
         }
         
