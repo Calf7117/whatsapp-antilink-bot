@@ -1,9 +1,12 @@
-// index.js - Performance-optimized Anti-Link Bot with message queue
-// FIXES IN THIS VERSION:
-// - Only monitors groups where ADMIN_NUMBER is an admin (reduces load significantly)
-// - Detects & blocks duplicate/spam messages
-// - Rate limiting protection with delays
-// - Caches group admin status to reduce API calls
+// index.js - Anti-Link Bot v2.1
+// FIXED: Now properly checks if BOT is admin in groups
+// 
+// Key changes:
+// - Checks if BOT (not owner) is admin - bot needs admin rights to delete messages
+// - Scans groups on startup to show which ones bot can manage
+// - Better debugging to see what's happening
+// - Spam/duplicate message detection
+// - Rate limiting protection
 
 const {
   default: makeWASocket,
@@ -17,27 +20,26 @@ const fs = require("fs");
 const path = require("path");
 
 // ---------- CONFIG ----------
-const ADMIN_NUMBER = "254106090661"; // Only this number is fully exempt
-const AUTH_DEBUG_LOG_ADMIN_JID = false;
+const ADMIN_NUMBER = "254106090661"; // Owner number - exempt from rules
+const DEBUG_MODE = true; // Set to true to see detailed logs
 // ----------------------------
 
 const userViolations = new Map();
 const messageQueue = [];
 let isProcessing = false;
+let botJid = null; // Bot's own JID
 
-// Cache for groups where owner is admin (reduces API calls)
-// Key: groupJid, Value: { isOwnerAdmin: boolean, lastChecked: timestamp }
-const groupAdminCache = new Map();
-const GROUP_CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache
+// Cache for group admin status
+const groupCache = new Map();
+const GROUP_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 // Track removed users
 const removedUsers = new Map();
 
-// Track recent messages for spam/duplicate detection
-// Key: `${groupJid}-${senderJid}`, Value: { lastMessage: string, count: number, timestamp: number }
+// Spam detection
 const recentMessages = new Map();
-const SPAM_WINDOW_MS = 30000; // 30 seconds window for duplicate detection
-const MAX_DUPLICATE_COUNT = 2; // After 2 same messages, it's spam
+const SPAM_WINDOW_MS = 30000;
+const MAX_DUPLICATE_COUNT = 2;
 
 if (!fs.existsSync(path.join(__dirname, "auth_info"))) {
   console.log("⚠️ auth_info not found — ensure your session files are in ./auth_info");
@@ -100,7 +102,8 @@ const KEYWORDS = [
   "buy","order","wholesale","cheap","delivery","inbox","mpesa",
   "ksh","kes","usd","call","business","contact","message"
 ];
-const KEYWORDS_REGEX = new RegExp("\\b(?:" + KEYWORDS.map(w => w.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")).join("|") + ")\\b", "i");
+const keywordPattern = "\\b(" + KEYWORDS.join("|") + ")\\b";
+const KEYWORDS_REGEX = new RegExp(keywordPattern, "i");
 
 function detectKeyword(text) {
   if (!text) return false;
@@ -111,7 +114,14 @@ function isOwnerJidMatch(senderJid) {
   if (!senderJid) return false;
   const adminNum = ADMIN_NUMBER.replace(/\D/g, "");
   const senderNum = senderJid.replace(/\D/g, "");
-  return senderNum === adminNum || senderJid.includes(adminNum);
+  
+  if (senderNum === adminNum || senderJid.includes(adminNum)) {
+    return true;
+  }
+  if (botJid && senderJid === botJid) {
+    return true;
+  }
+  return false;
 }
 
 function extractTextFromContent(content) {
@@ -202,18 +212,15 @@ function trackRemovedUser(groupJid, removedUserJid) {
   removedUsers.set(key, { timestamp: Date.now() });
 }
 
-// Check if message is spam/duplicate
 function checkAndTrackSpam(groupJid, senderJid, messageText) {
   const key = `${groupJid}-${senderJid}`;
   const now = Date.now();
   const normalizedText = messageText.trim().toLowerCase();
   
-  // Skip empty messages
   if (!normalizedText) return { isSpam: false, count: 0 };
   
   const existing = recentMessages.get(key);
   
-  // Clean up old entries
   if (existing && (now - existing.timestamp) > SPAM_WINDOW_MS) {
     recentMessages.delete(key);
     recentMessages.set(key, { lastMessage: normalizedText, count: 1, timestamp: now });
@@ -221,18 +228,15 @@ function checkAndTrackSpam(groupJid, senderJid, messageText) {
   }
   
   if (existing && existing.lastMessage === normalizedText) {
-    // Same message sent again
     existing.count++;
     existing.timestamp = now;
     return { isSpam: existing.count > MAX_DUPLICATE_COUNT, count: existing.count };
   } else {
-    // Different message, reset
     recentMessages.set(key, { lastMessage: normalizedText, count: 1, timestamp: now });
     return { isSpam: false, count: 1 };
   }
 }
 
-// Clean up old spam tracking entries periodically
 function cleanupSpamTracker() {
   const now = Date.now();
   for (const [key, value] of recentMessages.entries()) {
@@ -253,7 +257,7 @@ async function startBot() {
     const sock = makeWASocket({
       version,
       auth: { creds: state.creds, keys: keyStore },
-      printQRInTerminal: false,
+      printQRInTerminal: true,
       logger: createSilentLogger(),
       markOnlineOnConnect: false,
       generateHighQualityLinkPreview: false,
@@ -267,12 +271,17 @@ async function startBot() {
 
     sock.ev.on("creds.update", saveCreds);
 
-    sock.ev.on("connection.update", (update) => {
+    sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
       if (connection === "open") {
+        botJid = sock.user?.id;
         console.log("✅ BOT ONLINE - Stable");
+        console.log(`🤖 Bot JID: ${botJid}`);
         console.log(`👑 Owner (exempt): ${ADMIN_NUMBER}`);
-        console.log("📋 Only monitoring groups where owner is admin");
+        console.log("📋 Monitoring groups where BOT is admin");
+        
+        // Scan groups after 5 seconds
+        setTimeout(() => scanGroups(sock), 5000);
       } else if (connection === "close") {
         const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
         console.log("🔌 Connection closed:", lastDisconnect?.error?.message || "unknown");
@@ -282,47 +291,87 @@ async function startBot() {
           console.log("❌ Logged out from WhatsApp. Manual re-scan required.");
         }
       }
-      if (qr) console.log("⚠️ QR generated (unexpected if auth_info present).");
+      if (qr) console.log("📱 Scan QR code to login");
     });
 
-    // Check if owner is admin in group (with caching)
-    async function isOwnerAdminInGroup(groupJid) {
-      const cached = groupAdminCache.get(groupJid);
+    // Scan all groups on startup
+    async function scanGroups(sock) {
+      try {
+        console.log("🔍 Scanning groups...");
+        const groups = await sock.groupFetchAllParticipating();
+        let adminCount = 0;
+        let totalCount = 0;
+        
+        for (const [groupJid, groupData] of Object.entries(groups)) {
+          totalCount++;
+          const result = await checkGroupStatus(groupJid);
+          if (result.botIsAdmin) {
+            adminCount++;
+            console.log(`✅ Bot is admin in: ${groupData.subject}`);
+          }
+        }
+        
+        console.log(`📊 Bot is admin in ${adminCount}/${totalCount} groups`);
+        console.log("ℹ️ Bot will only work in groups where it is admin");
+      } catch (e) {
+        console.log("⚠️ Could not scan groups:", e.message);
+      }
+    }
+
+    // Check if bot is admin in group
+    async function checkGroupStatus(groupJid) {
+      const cached = groupCache.get(groupJid);
       const now = Date.now();
       
       if (cached && (now - cached.lastChecked) < GROUP_CACHE_TTL) {
-        return cached.isOwnerAdmin;
+        return cached;
       }
       
       try {
         const meta = await sock.groupMetadata(groupJid);
         if (!meta?.participants) {
-          groupAdminCache.set(groupJid, { isOwnerAdmin: false, lastChecked: now });
-          return false;
+          const result = { botIsAdmin: false, lastChecked: now };
+          groupCache.set(groupJid, result);
+          return result;
         }
         
-        const adminNum = ADMIN_NUMBER.replace(/\D/g, "");
-        const isOwnerAdmin = meta.participants.some(p => {
-          const pNum = p.id.replace(/\D/g, "");
-          return (pNum === adminNum || p.id.includes(adminNum)) && 
-                 (p.admin === "admin" || p.admin === "superadmin");
-        });
+        let botIsAdmin = false;
         
-        groupAdminCache.set(groupJid, { isOwnerAdmin, lastChecked: now });
-        return isOwnerAdmin;
+        for (const p of meta.participants) {
+          const isAdmin = p.admin === "admin" || p.admin === "superadmin";
+          
+          // Check if this participant is the bot
+          if (botJid) {
+            // Compare normalized JIDs
+            const pNormalized = p.id.split(":")[0].split("@")[0];
+            const botNormalized = botJid.split(":")[0].split("@")[0];
+            
+            if (pNormalized === botNormalized || p.id === botJid) {
+              botIsAdmin = isAdmin;
+              if (DEBUG_MODE && isAdmin) {
+                console.log(`🔍 Found bot as admin: ${p.id}`);
+              }
+              break;
+            }
+          }
+        }
+        
+        const result = { botIsAdmin, lastChecked: now };
+        groupCache.set(groupJid, result);
+        return result;
       } catch (e) {
-        // On error, assume not admin to avoid processing
-        return false;
+        if (cached) return cached;
+        return { botIsAdmin: false, lastChecked: now };
       }
     }
 
-    // Process message queue with rate limiting
+    // Process message queue
     async function processMessageQueue() {
       if (isProcessing || messageQueue.length === 0) return;
       
       isProcessing = true;
       let processedCount = 0;
-      const maxPerBatch = 10; // Process max 10 messages per batch to prevent rate limiting
+      const maxPerBatch = 10;
       
       while (messageQueue.length > 0 && processedCount < maxPerBatch) {
         const { msg, sock } = messageQueue.shift();
@@ -332,13 +381,11 @@ async function startBot() {
         } catch (error) {
           console.log("⚠️ Error processing queued message:", error.message);
         }
-        // Delay between messages to prevent rate limiting
         await new Promise(resolve => setTimeout(resolve, 300));
       }
       
       isProcessing = false;
       
-      // If more messages in queue, schedule next batch
       if (messageQueue.length > 0) {
         setTimeout(() => processMessageQueue(), 1000);
       }
@@ -353,36 +400,34 @@ async function startBot() {
         const groupJid = msg.key.remoteJid;
         const senderJid = msg.key.participant || msg.key.remoteJid;
 
-        // CRITICAL: Only process groups where owner is admin
-        const ownerIsAdmin = await isOwnerAdminInGroup(groupJid);
-        if (!ownerIsAdmin) {
-          return; // Skip this group entirely
+        // Check if bot is admin in this group
+        const groupStatus = await checkGroupStatus(groupJid);
+        
+        if (!groupStatus.botIsAdmin) {
+          return; // Skip - bot can't take action here
         }
 
         const ownerIsSender = isOwnerJidMatch(senderJid);
         const visibleText = extractVisibleText(msg).trim();
         const textLower = visibleText.toLowerCase();
 
-        // !bot command handling
+        // !bot command
         if (textLower === "!bot") {
           try {
-            if (ownerIsSender) {
-              await sock.sendMessage(groupJid, {
-                text: `✅ ANTI-LINK BOT ACTIVE\nOwner (exempt): ${ADMIN_NUMBER}\nStatus: Online (owner privileges)\nMonitoring: Groups where owner is admin only`,
-              });
-            } else {
-              await sock.sendMessage(groupJid, { text: `✅ ANTI-LINK BOT ACTIVE\nStatus: Monitoring for violations` });
-            }
+            const response = ownerIsSender
+              ? `✅ ANTI-LINK BOT ACTIVE\nOwner: ${ADMIN_NUMBER}\nBot JID: ${botJid}\nStatus: Online (owner privileges)`
+              : `✅ ANTI-LINK BOT ACTIVE\nStatus: Monitoring for violations`;
+            await sock.sendMessage(groupJid, { text: response });
           } catch (e) {
             console.log("⚠️ Could not send !bot reply:", e.message);
           }
           return;
         }
 
-        // Owner exemption
+        // Owner is exempt
         if (ownerIsSender) return;
 
-        // Check for spam/duplicate messages
+        // Check for spam
         const spamCheck = checkAndTrackSpam(groupJid, senderJid, visibleText);
         
         // Violation checks
@@ -407,19 +452,17 @@ async function startBot() {
 
           const userKey = `${groupJid}-${senderJid}`;
           const current = userViolations.get(userKey) || 0;
-          // Spam counts as extra violations
           const violationIncrease = spamCheck.isSpam ? Math.min(spamCheck.count - 1, 2) : 1;
           const updated = current + violationIncrease;
           userViolations.set(userKey, updated);
 
-          console.log(`🚫 Violation #${updated} → ${senderJid} | group:${groupJid} | reason:${reasonParts.join(", ")}`);
+          console.log(`🚫 Violation #${updated} → ${senderJid} | reason:${reasonParts.join(", ")}`);
 
-          // Delete message with retry
+          // Delete message
           try {
             await sock.sendMessage(groupJid, { delete: msg.key });
           } catch (delErr) {
             if (delErr.message?.includes("rate-overlimit")) {
-              // Wait and retry once
               await new Promise(r => setTimeout(r, 2000));
               try {
                 await sock.sendMessage(groupJid, { delete: msg.key });
@@ -434,12 +477,12 @@ async function startBot() {
           // Remove on 3rd strike
           if (updated >= 3) {
             try {
-              await new Promise(r => setTimeout(r, 500)); // Small delay before remove
+              await new Promise(r => setTimeout(r, 500));
               await sock.groupParticipantsUpdate(groupJid, [senderJid], "remove");
               trackRemovedUser(groupJid, senderJid);
               userViolations.delete(userKey);
               recentMessages.delete(`${groupJid}-${senderJid}`);
-              console.log(`❌ Removed ${senderJid} from ${groupJid} after ${updated} violations`);
+              console.log(`❌ Removed ${senderJid} after ${updated} violations`);
             } catch (remErr) {
               console.log("⚠️ Could not remove user:", remErr.message);
             }
@@ -450,14 +493,13 @@ async function startBot() {
       }
     }
 
-    // Message handler - adds to queue
+    // Message handler
     sock.ev.on("messages.upsert", async (m) => {
       const messages = m.messages || [];
       
       for (const msg of messages) {
         if (!msg) continue;
         
-        // Quick filter: only queue group messages
         if (msg.key?.remoteJid?.includes("@g.us") && !msg.key.fromMe && msg.message) {
           messageQueue.push({ msg, sock });
         }
@@ -466,44 +508,42 @@ async function startBot() {
       processMessageQueue();
     });
     
-    // Process queue and cleanup periodically (less frequently)
+    // Periodic cleanup
     setInterval(() => {
       if (messageQueue.length > 0) {
-        console.log(`📬 Processing ${messageQueue.length} queued messages...`);
         processMessageQueue();
       }
       cleanupSpamTracker();
-    }, 15000); // Every 15 seconds instead of 5
+    }, 15000);
     
-    // Clear group cache periodically
+    // Clear cache periodically
     setInterval(() => {
       const now = Date.now();
-      for (const [key, value] of groupAdminCache.entries()) {
+      for (const [key, value] of groupCache.entries()) {
         if (now - value.lastChecked > GROUP_CACHE_TTL * 2) {
-          groupAdminCache.delete(key);
+          groupCache.delete(key);
         }
       }
-    }, 60000); // Every minute
+    }, 60000);
 
-    // Monitor group updates for re-add prevention
+    // Monitor group updates
     sock.ev.on("group-participants.update", async (update) => {
       try {
         const { id: groupJid, participants, action } = update;
         
-        // Only care about groups where owner is admin
-        const ownerIsAdmin = await isOwnerAdminInGroup(groupJid);
-        if (!ownerIsAdmin) return;
+        const groupStatus = await checkGroupStatus(groupJid);
+        if (!groupStatus.botIsAdmin) return;
         
         if (action === "add") {
           for (const participant of participants) {
             if (wasRecentlyRemoved(groupJid, participant)) {
-              console.log(`🚫 Blocking re-add of ${participant} to ${groupJid}`);
+              console.log(`🚫 Blocking re-add of ${participant}`);
               await new Promise(r => setTimeout(r, 1000));
               try {
                 await sock.groupParticipantsUpdate(groupJid, [participant], "remove");
                 console.log(`❌ Re-removed ${participant}`);
                 await sock.sendMessage(groupJid, {
-                  text: `⚠️ This user was recently removed and cannot be added back yet.`
+                  text: "⚠️ This user was recently removed and cannot be added back yet."
                 });
               } catch (e) {
                 console.log("⚠️ Could not block re-add:", e.message);
@@ -516,7 +556,7 @@ async function startBot() {
       }
     });
 
-    console.log("🚀 Bot initialized successfully");
+    console.log("🚀 Bot initialized - waiting for connection...");
 
   } catch (startError) {
     console.log("❌ Start error:", startError.message);
