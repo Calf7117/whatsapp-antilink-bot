@@ -1,11 +1,20 @@
-// index.js - Anti-Link Bot v2.2
-// FIXED: Better JID matching for new WhatsApp format
+// index.js - Anti-Link Bot v2.4
+// FIXED: Admin detection, group allowlist, duplicate-spam control, and load reduction
+//
+// What this fixes for your logs:
+// - “Bot is admin in 0/13 groups”: now uses robust JID matching (device suffix :9, @lid vs @s.whatsapp.net)
+// - Bot will ONLY process messages from groups in an allowlist built at startup (admin groups only)
+// - Duplicate messages sent back-to-back are treated as spam violations and deleted immediately
+// - Reduces rate-overlimit by batching deletes & spacing actions
+// - Bad MAC spam: ignores undecrypted messages early and avoids extra metadata calls
+
+
 // 
-// Key changes in v2.2:
-// - Fixed JID normalization to handle 254106090661:9@s.whatsapp.net format
-// - Extracts phone number from any JID format for comparison
-// - Shows detailed debug info during group scan
-// - Works in groups where the bot's phone number is admin
+// Key changes in v2.3:
+// - !bot command works everywhere (for debugging)
+// - Shows detailed participant logs to debug admin detection
+// - Added protections for "Bad MAC" errors
+// - Explicitly logs when bot is found in a group
 
 const {
   default: makeWASocket,
