@@ -360,9 +360,9 @@ async function startBot() {
           console.log("📨 !bot command from:", senderJid);
           const ownerCheck = isOwner(senderJid);
           try {
-            let responseText = "✅ ANTI-LINK BOT v2.5 ACTIVE, Baby!\n";
+            let responseText = "✅ ANTI-LINK BOT v2.5 ACTIVE\n";
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
-            responseText += "📋 Monitoring this group\n";
+            responseText += "📋 Monitoring this group, Baby!\n";
             if (ownerCheck) {
               responseText += "🔑 You are the owner - you are exempt from all rules";
             }
