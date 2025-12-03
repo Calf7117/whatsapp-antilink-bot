@@ -1,6 +1,6 @@
-// index.js - Anti-Link Bot v2.4
-// FIXED: Works with WhatsApp's new LID-only participant format
-// Processes ALL groups - handles delete failures gracefully
+// index.js - Anti-Link Bot v2.6
+// NEW: Only protects groups where OWNER (254106090661) is admin
+// FIXED: Delete for EVERYONE (revoke) + !bot command works
 
 const {
   default: makeWASocket,
@@ -14,25 +14,21 @@ const fs = require("fs");
 const path = require("path");
 
 // ---------- CONFIG ----------
-const ADMIN_NUMBER = "254106090661"; // Owner - fully exempt from all rules
+const ADMIN_NUMBER = "254106090661"; // Owner - fully exempt + admin check
 const DEBUG_MODE = false;            // Set true for verbose logging
 // ----------------------------
 
-// Violations tracking
 const userViolations = new Map();
-
-// Message queue
 const messageQueue = [];
 let isProcessing = false;
 
-// Duplicate/spam tracking
 const recentMessages = new Map();
 const DUP_WINDOW_MS = 30000;
 const DUP_BLOCK_FROM = 2;
 
-// Track groups where bot is not admin
-const notAdminGroups = new Map();
-const NOT_ADMIN_CACHE_TTL = 10 * 60 * 1000;
+// Cache for owner admin status in groups
+const ownerAdminGroups = new Map();
+const OWNER_ADMIN_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 if (!fs.existsSync(path.join(__dirname, "auth_info"))) {
   console.log("⚠️ auth_info not found — ensure your session files are in ./auth_info");
@@ -47,7 +43,6 @@ const createSilentLogger = () => {
   };
 };
 
-// Extract phone number from JID
 function extractPhoneNumber(jid) {
   if (!jid) return "";
   let clean = String(jid).split("@")[0];
@@ -55,7 +50,6 @@ function extractPhoneNumber(jid) {
   return clean.replace(/\D/g, "");
 }
 
-// Check if sender is the owner
 function isOwner(senderJid) {
   if (!senderJid) return false;
   const phone = extractPhoneNumber(senderJid);
@@ -63,7 +57,6 @@ function isOwner(senderJid) {
   return senderJid.includes(ADMIN_NUMBER);
 }
 
-// Detection functions
 function detectLinks(text) {
   if (!text) return false;
   const patterns = [
@@ -230,12 +223,11 @@ function cleanupCaches() {
   for (const [k, v] of recentMessages.entries()) {
     if ((now - v.ts) > DUP_WINDOW_MS * 3) recentMessages.delete(k);
   }
-  for (const [k, v] of notAdminGroups.entries()) {
-    if ((now - v) > NOT_ADMIN_CACHE_TTL) notAdminGroups.delete(k);
+  for (const [k, v] of ownerAdminGroups.entries()) {
+    if ((now - v.timestamp) > OWNER_ADMIN_CACHE_TTL) ownerAdminGroups.delete(k);
   }
 }
 
-// Bot startup
 async function startBot() {
   try {
     const { state, saveCreds } = await useMultiFileAuthState("auth_info");
@@ -266,15 +258,14 @@ async function startBot() {
       if (connection === "open") {
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║     ✅ ANTI-LINK BOT v2.4 ONLINE        ║");
+        console.log("║     ✅ ANTI-LINK BOT v2.6 ONLINE        ║");
         console.log("╠══════════════════════════════════════════╣");
         console.log("║  🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
         console.log("║  👑 Owner: " + ADMIN_NUMBER.padEnd(29) + "║");
-        console.log("║  📋 Mode: All groups (try & catch)       ║");
+        console.log("║  📋 Mode: Owner admin groups only        ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
-        console.log("Bot will process ALL groups and handle errors gracefully.");
-        console.log("If bot isn't admin in a group, delete will fail silently.");
+        console.log("Bot only protects groups where " + ADMIN_NUMBER + " is admin");
         console.log("");
       }
 
@@ -295,13 +286,41 @@ async function startBot() {
       }
     });
 
-    // Delete message with retry
-    async function safeDelete(groupJid, msgKey) {
-      const notAdmin = notAdminGroups.get(groupJid);
-      if (notAdmin && (Date.now() - notAdmin) < NOT_ADMIN_CACHE_TTL) {
-        return false;
+    // Check if owner is admin in this group (with caching)
+    async function isOwnerAdminInGroup(groupJid) {
+      const cached = ownerAdminGroups.get(groupJid);
+      if (cached && (Date.now() - cached.timestamp) < OWNER_ADMIN_CACHE_TTL) {
+        return cached.isAdmin;
       }
 
+      try {
+        const meta = await sock.groupMetadata(groupJid);
+        if (!meta?.participants) return false;
+
+        const admins = meta.participants
+          .filter((p) => p.admin === "admin" || p.admin === "superadmin")
+          .map((p) => extractPhoneNumber(p.id));
+
+        const ownerIsAdmin = admins.includes(ADMIN_NUMBER);
+        
+        ownerAdminGroups.set(groupJid, {
+          isAdmin: ownerIsAdmin,
+          timestamp: Date.now()
+        });
+
+        if (DEBUG_MODE) {
+          console.log("👮 Owner admin check:", groupJid.substring(0, 20), "=>", ownerIsAdmin);
+        }
+
+        return ownerIsAdmin;
+      } catch (e) {
+        if (DEBUG_MODE) console.log("⚠️ Could not check admin status:", e.message);
+        return false;
+      }
+    }
+
+    // Delete message (revoke for everyone)
+    async function safeDelete(groupJid, msgKey) {
       try {
         await sock.sendMessage(groupJid, { delete: msgKey });
         return true;
@@ -318,11 +337,7 @@ async function startBot() {
           }
         }
         
-        if (msg.includes("forbidden") || msg.includes("not-authorized") || msg.includes("403")) {
-          notAdminGroups.set(groupJid, Date.now());
-          if (DEBUG_MODE) console.log("📝 Cached: bot not admin in", groupJid);
-        }
-        
+        if (DEBUG_MODE) console.log("⚠️ Delete failed:", e.message);
         return false;
       }
     }
@@ -348,25 +363,34 @@ async function startBot() {
         const groupJid = msg.key.remoteJid;
         const senderJid = msg.key.participant || msg.key.remoteJid;
 
-        // Owner is ALWAYS exempt
+        const visibleText = extractVisibleText(msg).trim();
+        const textLower = visibleText.toLowerCase();
+
+        // !bot command - check BEFORE everything else
+        if (textLower === "!bot") {
+          try {
+            const ownerIsAdmin = await isOwnerAdminInGroup(groupJid);
+            const status = ownerIsAdmin ? "✅ ACTIVE (owner is admin)" : "⚠️ INACTIVE (owner not admin)";
+            await sock.sendMessage(groupJid, {
+              text: "🤖 ANTI-LINK BOT v2.6\n" + status + "\n👑 Owner: " + ADMIN_NUMBER
+            });
+          } catch (e) {
+            console.log("⚠️ Could not send !bot reply:", e.message);
+          }
+          return;
+        }
+
+        // Owner is ALWAYS exempt from violations
         if (isOwner(senderJid)) {
           if (DEBUG_MODE) console.log("👑 Owner message - exempt");
           return;
         }
 
-        const visibleText = extractVisibleText(msg).trim();
-        const textLower = visibleText.toLowerCase();
-
-        // !bot command
-        if (textLower === "!bot") {
-          try {
-            await sock.sendMessage(groupJid, {
-              text: "✅ ANTI-LINK BOT v2.4 ACTIVE\n👑 Owner: " + ADMIN_NUMBER + "\n📋 Monitoring this group"
-            });
-          } catch {
-            // Ignore
-          }
-          return;
+        // Check if owner is admin in this group
+        const ownerIsAdmin = await isOwnerAdminInGroup(groupJid);
+        if (!ownerIsAdmin) {
+          if (DEBUG_MODE) console.log("🚫 Skipping group - owner not admin");
+          return; // Skip this group entirely
         }
 
         // Check for violations
@@ -401,11 +425,11 @@ async function startBot() {
 
         console.log("🚫 Violation #" + updated + " | " + senderJid.substring(0, 20) + "... | " + reasons.join(", "));
 
-        // Try to delete message
+        // Delete message FOR EVERYONE
         const deleted = await safeDelete(groupJid, msg.key);
         
         if (deleted) {
-          console.log("✅ Deleted message");
+          console.log("✅ Deleted message (revoked for everyone)");
           
           // Remove on 3rd strike
           if (updated >= 3) {
