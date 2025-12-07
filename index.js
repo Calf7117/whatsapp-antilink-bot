@@ -1,7 +1,6 @@
-// index.js - Final stable Anti-Link Bot (CommonJS)
-// - All requested rules: links, phone numbers, APK (MIME), real business posts, keyword blocking (whole words)
-// - Owner exempt (ADMIN_NUMBER). Other admins can use !bot but are not exempt.
-// - Stability: cached key store, no auth_info/signal wipe, getMessage fallback, backoff
+// index.js - Anti-Link Bot v2.6
+// FIXED: !bot command works for owner, Delete for EVERYONE
+// Key fix: !bot check is BEFORE fromMe filter so owner can use it
 
 const {
   default: makeWASocket,
@@ -15,154 +14,240 @@ const fs = require("fs");
 const path = require("path");
 
 // ---------- CONFIG ----------
-const ADMIN_NUMBER = "254106090661"; // Only this number is fully exempt
-const AUTH_DEBUG_LOG_ADMIN_JID = false; // set true once to log exact owner JID as seen by the bot
+const ADMIN_NUMBER = "254106090661"; // Owner - fully exempt from all rules
+const DEBUG_MODE = true;             // Set true for verbose logging
 // ----------------------------
 
 const userViolations = new Map();
+const messageQueue = [];
+let isProcessing = false;
 
-// NOTE: Do NOT delete auth_info/signal here. Preserving signal keys reduces Bad MACs.
+// Duplicate/spam tracking
+const recentMessages = new Map();
+const DUP_WINDOW_MS = 30000;
+const DUP_BLOCK_FROM = 2;
+
+// Track groups where bot is not admin
+const notAdminGroups = new Map();
+const NOT_ADMIN_CACHE_TTL = 10 * 60 * 1000;
+
 if (!fs.existsSync(path.join(__dirname, "auth_info"))) {
   console.log("⚠️ auth_info not found — ensure your session files are in ./auth_info");
 }
 
-// Minimal silent logger for Baileys internals
 const createSilentLogger = () => {
   const noOp = () => {};
   return {
     level: "silent",
-    trace: noOp,
-    debug: noOp,
-    info: noOp,
-    warn: noOp,
-    error: noOp,
-    fatal: noOp,
+    trace: noOp, debug: noOp, info: noOp, warn: noOp, error: noOp, fatal: noOp,
     child: () => createSilentLogger(),
   };
 };
 
-// ------------------ Detection Helpers ------------------
+// Extract phone number from JID
+function extractPhoneNumber(jid) {
+  if (!jid) return "";
+  let clean = String(jid).split("@")[0];
+  clean = clean.split(":")[0];
+  return clean.replace(/\D/g, "");
+}
 
-// Link detection rules: http(s), www, whatsapp catalog/wa.me, plus vetted TLD list
+// Check if sender is the owner
+function isOwner(senderJid) {
+  if (!senderJid) return false;
+  const phone = extractPhoneNumber(senderJid);
+  if (phone === ADMIN_NUMBER) return true;
+  if (senderJid.includes(ADMIN_NUMBER)) return true;
+  return false;
+}
+
+// Detection functions
 function detectLinks(text) {
   if (!text) return false;
   const patterns = [
-    /https?:\/\/[^\s]+/i,        // explicit http(s)
-    /www\.[^\s]+/i,              // www.*
-    // whatsapp catalog / wa.me direct patterns (buttons often resolve to these)
+    /https?:\/\/[^\s]+/i,
+    /www\.[^\s]+/i,
     /\b(?:wa\.me|whatsapp\.com)\/\S+/i,
-    // domain + common real TLDs (avoid matching "word.word" nonsense)
     /\b[A-Za-z0-9-]+\.(?:com|net|org|io|co|me|app|tech|info|biz|store|online|ly|ge|ke|uk|us|tv|gg|site|blog|news)(?:\/\S*)?\b/i,
   ];
   return patterns.some((r) => r.test(text));
 }
 
-// Phone numbers: any 9 or more digits inside visible text
 function detectPhoneNumbers(text) {
   if (!text) return false;
   return /\d{9,}/.test(text);
 }
 
-// APK check: ONLY by MIME type (real APK file)
 function isAPKFile(msg) {
   return msg.message?.documentMessage?.mimetype === "application/vnd.android.package-archive";
 }
 
-// Business detection: robust check for real product/catalog OR externalAdReply pointing to whatsapp catalog/wa.me
 function isBusinessPost(msg) {
   const p = msg.message?.productMessage;
   const c = msg.message?.catalogMessage;
-
-  // If neither present, still check external previews (buttons) that resolve to catalogs
   const ext = msg.message?.extendedTextMessage?.contextInfo?.externalAdReply;
+
   if ((!p && !c) && ext && (ext.sourceUrl || ext.mediaUrl || ext.title)) {
     const src = String(ext.sourceUrl || "");
     if (/\b(?:wa\.me|whatsapp\.com)\/(?:catalog|c)\/?/i.test(src)) return true;
-    // if externalAdReply has obvious catalog URL, treat as business-like link
   }
-
   if (p) {
     const prod = p.product || {};
     if (prod.productImage || prod.title || prod.description || prod.currency || prod.priceAmount1000) return true;
   }
-
   if (c) {
     const cat = c.catalog || {};
     if (cat.title || (cat.products && cat.products.length > 0)) return true;
   }
-
   return false;
 }
 
-// Keyword blocking: whole-word matches only (case-insensitive)
 const KEYWORDS = [
   "child","rape","free","price","payment","rupees","rupee","rs",
   "offer","discount","deal","promo","promotion","sell","selling",
   "buy","order","wholesale","cheap","delivery","inbox","mpesa",
-  "ksh","kes","usd"
+  "ksh","kes","usd","call","business","contact","message"
 ];
-// prepare regex: \b(?:word1|word2|...)\b
-const KEYWORDS_REGEX = new RegExp("\\b(?:" + KEYWORDS.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")\\b", "i");
+
+const KEYWORDS_REGEX = new RegExp("\\b(?:" + KEYWORDS.join("|") + ")\\b", "i");
 
 function detectKeyword(text) {
   if (!text) return false;
   return KEYWORDS_REGEX.test(text);
 }
 
-// Owner matching across JID formats
-function isOwnerJidMatch(senderJid) {
-  if (!senderJid) return false;
-  const adminNum = ADMIN_NUMBER.replace(/\D/g, "");
-  const senderNum = senderJid.replace(/\D/g, "");
-  const possibleForms = [
-    `${adminNum}@s.whatsapp.net`,
-    `${adminNum}@whatsapp.net`,
-    `${adminNum}@c.us`,
-    adminNum,
-    `+${adminNum}`,
-  ];
-  return senderNum === adminNum || possibleForms.includes(senderJid) || senderJid.includes(adminNum);
+function extractTextFromContent(content) {
+  if (!content || typeof content !== "object") return "";
+  const texts = [];
+  const push = (t) => { if (t && typeof t === "string") texts.push(t); };
+
+  push(content.conversation);
+  push(content.extendedTextMessage?.text);
+  push(content.imageMessage?.caption);
+  push(content.videoMessage?.caption);
+  push(content.documentMessage?.caption);
+
+  const bm = content.buttonsMessage;
+  if (bm) {
+    push(bm.contentText); push(bm.footerText); push(bm.headerText);
+    (bm.buttons || []).forEach((b) => push(b.buttonText?.displayText));
+  }
+
+  const tmpl = content.templateMessage?.hydratedTemplate;
+  if (tmpl) {
+    push(tmpl.hydratedContentText);
+    push(tmpl.hydratedFooterText);
+    push(tmpl.hydratedTitleText);
+    (tmpl.hydratedButtons || []).forEach((btn) => {
+      if (!btn) return;
+      if (btn.quickReplyButton) push(btn.quickReplyButton.displayText);
+      if (btn.urlButton) { push(btn.urlButton.displayText); push(btn.urlButton.url); }
+      if (btn.callButton) push(btn.callButton.displayText);
+    });
+  }
+
+  const list = content.listMessage;
+  if (list) {
+    push(list.title); push(list.description); push(list.footerText); push(list.text);
+    (list.sections || []).forEach((sec) => {
+      (sec.rows || []).forEach((row) => { push(row.title); push(row.description); });
+    });
+  }
+
+  const im = content.interactiveMessage;
+  if (im) {
+    push(im.body?.text);
+    push(im.footer?.text);
+    push(im.header?.title);
+  }
+
+  const ext = content.extendedTextMessage?.contextInfo?.externalAdReply;
+  if (ext) {
+    push(ext.title);
+    push(ext.body);
+    push(ext.mediaUrl);
+    push(ext.sourceUrl);
+  }
+
+  const quoted = content.extendedTextMessage?.contextInfo?.quotedMessage;
+  if (quoted && typeof quoted === "object") push(extractTextFromContent(quoted));
+
+  const vo = content.viewOnceMessage?.message ||
+             content.viewOnceMessageV2?.message ||
+             content.viewOnceMessageV2Extension?.message;
+  if (vo) push(extractTextFromContent(vo));
+
+  return texts.join(" ").trim();
 }
 
-// Extract visible text safely (only from user-facing fields)
 function extractVisibleText(msg) {
-  try {
-    return (
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      msg.message.imageMessage?.caption ||
-      msg.message.videoMessage?.caption ||
-      msg.message.documentMessage?.caption ||
-      ""
-    ) || "";
-  } catch {
-    return "";
+  try { return extractTextFromContent(msg.message || {}) || ""; }
+  catch { return ""; }
+}
+
+function hasButtons(msg) {
+  const m = msg.message || {};
+  return !!(m.buttonsMessage || m.templateMessage || m.listMessage || m.interactiveMessage);
+}
+
+function isContactMessage(msg) {
+  const m = msg.message || {};
+  if (m.contactMessage || m.contactsArrayMessage) return true;
+  const quoted = m.extendedTextMessage?.contextInfo?.quotedMessage;
+  if (quoted?.contactMessage || quoted?.contactsArrayMessage) return true;
+  const vo = m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m.viewOnceMessageV2Extension?.message;
+  if (vo?.contactMessage || vo?.contactsArrayMessage) return true;
+  return false;
+}
+
+function checkDuplicate(groupJid, senderJid, visibleText) {
+  const text = (visibleText || "").trim().toLowerCase();
+  if (!text || text.length < 5) return { isDuplicate: false, count: 0 };
+
+  const key = groupJid + "-" + senderJid;
+  const now = Date.now();
+  const prev = recentMessages.get(key);
+
+  if (!prev || (now - prev.ts) > DUP_WINDOW_MS) {
+    recentMessages.set(key, { last: text, count: 1, ts: now });
+    return { isDuplicate: false, count: 1 };
+  }
+
+  if (prev.last === text) {
+    prev.count += 1;
+    prev.ts = now;
+    return { isDuplicate: prev.count >= DUP_BLOCK_FROM, count: prev.count };
+  }
+
+  recentMessages.set(key, { last: text, count: 1, ts: now });
+  return { isDuplicate: false, count: 1 };
+}
+
+function cleanupCaches() {
+  const now = Date.now();
+  for (const [k, v] of recentMessages.entries()) {
+    if ((now - v.ts) > DUP_WINDOW_MS * 3) recentMessages.delete(k);
+  }
+  for (const [k, v] of notAdminGroups.entries()) {
+    if ((now - v) > NOT_ADMIN_CACHE_TTL) notAdminGroups.delete(k);
   }
 }
 
-// ------------------ Bot startup ------------------
+// Bot startup
 async function startBot() {
   try {
     const { state, saveCreds } = await useMultiFileAuthState("auth_info");
-
-    // Cache the keys rather than using raw state.keys directly (reduces Bad MACs)
     const keyStore = makeCacheableSignalKeyStore(state.keys, createSilentLogger());
 
     const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`📱 WA v${version.join(".")}  latest: ${isLatest}`);
+    console.log("📱 WA v" + version.join(".") + " (latest: " + isLatest + ")");
 
     const sock = makeWASocket({
       version,
-      auth: {
-        creds: state.creds,
-        keys: keyStore,
-      },
-      printQRInTerminal: false,
+      auth: { creds: state.creds, keys: keyStore },
       logger: createSilentLogger(),
       markOnlineOnConnect: false,
       generateHighQualityLinkPreview: false,
-
-      // Stability improvements
       retryRequestDelayMs: 2000,
       maxRetries: 5,
       connectTimeoutMs: 30000,
@@ -173,146 +258,247 @@ async function startBot() {
 
     sock.ev.on("creds.update", saveCreds);
 
-    sock.ev.on("connection.update", (update) => {
+    sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
+
       if (connection === "open") {
-        console.log("✅ BOT ONLINE - Stable");
-        console.log(`👑 Owner (exempt): ${ADMIN_NUMBER}`);
-      } else if (connection === "close") {
-        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        console.log("");
+        console.log("╔══════════════════════════════════════════╗");
+        console.log("║     ✅ ANTI-LINK BOT v2.5 ONLINE        ║");
+        console.log("╠══════════════════════════════════════════╣");
+        console.log("║  🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
+        console.log("║  👑 Owner: " + ADMIN_NUMBER.padEnd(29) + "║");
+        console.log("║  📋 Mode: All groups (try & catch)       ║");
+        console.log("║  🔧 !bot now works for owner            ║");
+        console.log("╚══════════════════════════════════════════╝");
+        console.log("");
+        console.log("✅ Bot will process ALL groups.");
+        console.log("✅ Messages deleted for EVERYONE (not just sender).");
+        console.log("✅ Owner can use !bot command.");
+        console.log("");
+      }
+
+      if (connection === "close") {
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = code !== DisconnectReason.loggedOut;
         console.log("🔌 Connection closed:", lastDisconnect?.error?.message || "unknown");
         if (shouldReconnect) {
+          console.log("🔄 Reconnecting in 5 seconds...");
           setTimeout(() => startBot().catch(() => {}), 5000);
         } else {
-          console.log("❌ Logged out from WhatsApp. Manual re-scan required.");
+          console.log("❌ Logged out. Delete auth_info folder and re-scan QR.");
         }
       }
+
       if (qr) {
-        console.log("⚠️ QR generated (unexpected if auth_info present).");
+        console.log("📱 QR Code received - scan with WhatsApp to login");
       }
     });
 
-    // One-time debug printing of owner JID if requested
-    let ownerJidLogged = false;
-
-    // Message handler
-    sock.ev.on("messages.upsert", async (m) => {
-      const msg = m.messages?.[0];
-      if (!msg) return;
+    // Delete message for EVERYONE with retry
+    async function safeDelete(groupJid, msgKey) {
+      const notAdmin = notAdminGroups.get(groupJid);
+      if (notAdmin && (Date.now() - notAdmin) < NOT_ADMIN_CACHE_TTL) {
+        if (DEBUG_MODE) console.log("⏭️ Skipping delete - cached as not admin");
+        return false;
+      }
 
       try {
-        // Only handle decrypted, group messages not from the bot itself
-        if (!msg.key?.remoteJid || !msg.key.remoteJid.includes("@g.us") || msg.key.fromMe) return;
-        if (!msg.message) return; // unreadable or undecrypted (Bad MAC etc) — skip gracefully
+        await sock.sendMessage(groupJid, { delete: msgKey });
+        return true;
+      } catch (e) {
+        const errMsg = String(e?.message || e || "");
+        console.log("⚠️ Delete error:", errMsg);
+        
+        if (errMsg.includes("rate-overlimit")) {
+          console.log("⏳ Rate limited, waiting 3 seconds...");
+          await new Promise(r => setTimeout(r, 3000));
+          try {
+            await sock.sendMessage(groupJid, { delete: msgKey });
+            return true;
+          } catch (e2) {
+            console.log("⚠️ Retry failed:", e2?.message);
+            return false;
+          }
+        }
+        
+        if (errMsg.includes("forbidden") || errMsg.includes("not-authorized") || errMsg.includes("403")) {
+          notAdminGroups.set(groupJid, Date.now());
+          console.log("📝 Bot is not admin in this group - caching for 10 min");
+        }
+        
+        return false;
+      }
+    }
+
+    // Remove user from group
+    async function safeRemove(groupJid, userJid) {
+      try {
+        await sock.groupParticipantsUpdate(groupJid, [userJid], "remove");
+        console.log("✅ User removed from group");
+        return true;
+      } catch (e) {
+        console.log("⚠️ Could not remove user:", e?.message);
+        return false;
+      }
+    }
+
+    // Main message handler
+    async function handleMessage(msg) {
+      try {
+        if (!msg?.key?.remoteJid?.endsWith("@g.us")) return;
+        if (!msg.message) return;
 
         const groupJid = msg.key.remoteJid;
         const senderJid = msg.key.participant || msg.key.remoteJid;
 
-        // optional debug of owner JID as seen
-        if (AUTH_DEBUG_LOG_ADMIN_JID && !ownerJidLogged && isOwnerJidMatch(senderJid)) {
-          console.log("🔎 Seen owner JID as:", senderJid);
-          ownerJidLogged = true;
-        }
-
-        // Fetch group admins (used so group admins can use !bot)
-        let groupAdmins = [];
-        try {
-          const meta = await sock.groupMetadata(groupJid);
-          if (meta?.participants) {
-            groupAdmins = meta.participants
-              .filter((p) => p.admin === "admin" || p.admin === "superadmin")
-              .map((p) => p.id);
-          }
-        } catch (e) {
-          // ignore metadata fetch error — still safe
-        }
-
-        const ownerIsSender = isOwnerJidMatch(senderJid);
-        const senderIsAdmin = groupAdmins.includes(senderJid);
-
-        // Extract visible text
         const visibleText = extractVisibleText(msg).trim();
         const textLower = visibleText.toLowerCase();
 
-        // !bot command handling
+        // ✅ CHECK FOR !bot COMMAND FIRST (BEFORE fromMe FILTER)
         if (textLower === "!bot") {
+          console.log("📨 !bot command from:", senderJid);
+          const ownerCheck = isOwner(senderJid);
           try {
-            if (ownerIsSender) {
-              await sock.sendMessage(groupJid, {
-                text: `✅ ANTI-LINK BOT ACTIVE\nOwner (exempt): ${ADMIN_NUMBER}\nStatus: Online (owner privileges)`,
-              });
-            } else if (senderIsAdmin) {
-              await sock.sendMessage(groupJid, { text: `✅ ANTI-LINK BOT ACTIVE\nStatus: Online (group admin)` });
-            } else {
-              await sock.sendMessage(groupJid, { text: `✅ ANTI-LINK BOT ACTIVE\nStatus: Monitoring for violations` });
+            let responseText = "✅ ANTI-LINK BOT v2.5 ACTIVE\n";
+            responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
+            responseText += "📋 Monitoring this group, Baby!\n";
+            if (ownerCheck) {
+              responseText += "🔑 You are the owner - you are exempt from all rules";
             }
+            await sock.sendMessage(groupJid, { text: responseText });
+            console.log("✅ Sent !bot response");
           } catch (e) {
-            console.log("⚠️ Could not send !bot reply:", e.message);
+            console.log("⚠️ Could not send !bot reply:", e?.message);
           }
-          return; // !bot is not considered a violation
+          return;
         }
 
-        // Owner exemption: owner never deleted
-        if (ownerIsSender) return;
+        // ✅ NOW SKIP IF MESSAGE IS FROM BOT ITSELF (AFTER !bot check)
+        if (msg.key.fromMe) return;
 
-        // Violation checks:
+        // Owner is ALWAYS exempt from violations
+        if (isOwner(senderJid)) {
+          if (DEBUG_MODE) console.log("👑 Owner message - exempt from rules");
+          return;
+        }
+
+        // Check for violations
+        const dup = checkDuplicate(groupJid, senderJid, visibleText);
         const hasLink = detectLinks(visibleText);
         const hasPhone = detectPhoneNumbers(visibleText);
         const business = isBusinessPost(msg);
         const apk = isAPKFile(msg);
         const keyword = detectKeyword(visibleText);
+        const buttons = hasButtons(msg);
+        const contact = isContactMessage(msg);
 
-        if (hasLink || hasPhone || business || apk || keyword) {
-          const reasonParts = [];
-          if (hasLink) reasonParts.push("link");
-          if (hasPhone) reasonParts.push("phone");
-          if (business) reasonParts.push("business");
-          if (apk) reasonParts.push("apk");
-          if (keyword) reasonParts.push("keyword");
+        const violated = dup.isDuplicate || hasLink || hasPhone || business || apk || keyword || buttons || contact;
+        if (!violated) return;
 
-          const userKey = `${groupJid}-${senderJid}`;
-          const current = userViolations.get(userKey) || 0;
-          const updated = current + 1;
-          userViolations.set(userKey, updated);
+        // Build reason string
+        const reasons = [];
+        if (dup.isDuplicate) reasons.push("duplicate(x" + dup.count + ")");
+        if (hasLink) reasons.push("link");
+        if (hasPhone) reasons.push("phone");
+        if (business) reasons.push("business");
+        if (apk) reasons.push("apk");
+        if (keyword) reasons.push("keyword");
+        if (buttons) reasons.push("buttons");
+        if (contact) reasons.push("contact");
 
-          console.log(
-            `🚫 Violation #${updated} → ${senderJid} | group:${groupJid} | reason:${reasonParts.join(", ")}`
-          );
-          console.log(`📨 VisibleText: "${visibleText}"`);
+        // Track violations
+        const userKey = groupJid + "-" + senderJid;
+        const current = userViolations.get(userKey) || 0;
+        const updated = current + 1;
+        userViolations.set(userKey, updated);
 
-          // Silent delete
-          try {
-            await sock.sendMessage(groupJid, {
-              delete: { remoteJid: groupJid, fromMe: false, id: msg.key.id, participant: senderJid },
-            });
-          } catch (delErr) {
-            console.log("⚠️ Delete failed:", delErr.message);
-          }
+        console.log("");
+        console.log("🚫 VIOLATION DETECTED");
+        console.log("   User: " + senderJid);
+        console.log("   Group: " + groupJid);
+        console.log("   Reason: " + reasons.join(", "));
+        console.log("   Strike: " + updated + "/3");
+        console.log("   Text: " + visibleText.substring(0, 100));
 
+        // Try to delete message for EVERYONE
+        const deleted = await safeDelete(groupJid, msg.key);
+        
+        if (deleted) {
+          console.log("✅ Message deleted for EVERYONE");
+          
           // Remove on 3rd strike
           if (updated >= 3) {
-            try {
-              await sock.groupParticipantsUpdate(groupJid, [senderJid], "remove");
+            console.log("⚠️ User reached 3 strikes - removing from group...");
+            await new Promise(r => setTimeout(r, 500));
+            const removed = await safeRemove(groupJid, senderJid);
+            if (removed) {
               userViolations.delete(userKey);
-              console.log(`❌ Removed ${senderJid} from ${groupJid} after ${updated} violations`);
-            } catch (remErr) {
-              console.log("⚠️ Could not remove user:", remErr.message);
+              recentMessages.delete(userKey);
+              console.log("❌ User removed after 3 violations");
             }
           }
+        } else {
+          console.log("⚠️ Could not delete message (bot may not be admin)");
         }
-      } catch (procErr) {
-        // catch-all to avoid crashing message loop
-        console.log("⚠️ Error processing message:", procErr.message);
+        console.log("");
+      } catch (e) {
+        console.log("⚠️ Error handling message:", e?.message);
       }
+    }
+
+    // Process queue
+    async function processQueue() {
+      if (isProcessing || messageQueue.length === 0) return;
+      isProcessing = true;
+
+      const batchSize = 8;
+      let processed = 0;
+
+      while (messageQueue.length > 0 && processed < batchSize) {
+        const msg = messageQueue.shift();
+        await handleMessage(msg);
+        processed++;
+        await new Promise(r => setTimeout(r, 300));
+      }
+
+      isProcessing = false;
+      
+      if (messageQueue.length > 0) {
+        setTimeout(processQueue, 500);
+      }
+    }
+
+    // Message event
+    sock.ev.on("messages.upsert", async (m) => {
+      const messages = m.messages || [];
+      
+      for (const msg of messages) {
+        if (!msg?.key?.remoteJid?.endsWith("@g.us")) continue;
+        if (!msg.message) continue;
+        
+        if (DEBUG_MODE && !msg.key.fromMe) {
+          console.log("📩 New message in:", msg.key.remoteJid.substring(0, 20) + "...");
+        }
+        
+        messageQueue.push(msg);
+      }
+      
+      processQueue();
     });
-  } catch (startupErr) {
-    console.log("❌ Startup error:", startupErr.message);
+
+    // Periodic cleanup
+    setInterval(() => {
+      cleanupCaches();
+      if (messageQueue.length > 0) processQueue();
+    }, 30000);
+
+    console.log("🚀 Bot initialized - connecting to WhatsApp...");
+
+  } catch (e) {
+    console.log("❌ Start error:", e.message);
     setTimeout(() => startBot().catch(() => {}), 10000);
   }
 }
 
-// Start
-console.log("🚀 Starting Anti-Link Bot (stable/final) using stored session...");
-startBot().catch((e) => {
-  console.log("❌ Fatal start error:", e.message);
-});
+startBot();
