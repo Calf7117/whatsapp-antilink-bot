@@ -279,14 +279,26 @@ async function startBot() {
       }
 
       if (connection === "close") {
-        const code = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = code !== DisconnectReason.loggedOut;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const errorMessage = String(lastDisconnect?.error?.message || "").toLowerCase();
+
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+        const isConflict =
+          statusCode === DisconnectReason.connectionReplaced ||
+          errorMessage.includes("conflict") ||
+          errorMessage.includes("replaced");
+
         console.log("🔌 Connection closed:", lastDisconnect?.error?.message || "unknown");
-        if (shouldReconnect) {
+
+        if (isLoggedOut) {
+          console.log("❌ Logged out. Delete auth_info folder and re-scan QR.");
+        } else if (isConflict) {
+          console.log("⚠️ Session conflict detected (account opened somewhere else).");
+          console.log("ℹ️ Bot will NOT auto-reconnect to avoid conflict loop.");
+          console.log("➡️ Close WhatsApp Web / other devices, then restart this bot manually.");
+        } else {
           console.log("🔄 Reconnecting in 5 seconds...");
           setTimeout(() => startBot().catch(() => {}), 5000);
-        } else {
-          console.log("❌ Logged out. Delete auth_info folder and re-scan QR.");
         }
       }
 
