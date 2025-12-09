@@ -279,23 +279,14 @@ async function startBot() {
       }
 
       if (connection === "close") {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const msg = lastDisconnect?.error?.message || "unknown";
-
-        console.log("🔌 Connection closed:", msg, "code:", statusCode);
-
-        if (statusCode === DisconnectReason.loggedOut) {
-          // Logged out: require fresh QR scan
-          console.log("❌ Logged out. Delete auth_info folder and re-scan QR.");
-        } else if (statusCode === DisconnectReason.connectionReplaced) {
-          // True session conflict (opened somewhere else): do NOT auto-reconnect to avoid loop
-          console.log("⚠️ Session conflict detected (connection replaced on another device).");
-          console.log("ℹ️ Bot will NOT auto-reconnect to avoid a conflict loop.");
-          console.log("➡️ Close WhatsApp Web / other devices, then restart this bot manually.");
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = code !== DisconnectReason.loggedOut;
+        console.log("🔌 Connection closed:", lastDisconnect?.error?.message || "unknown");
+        if (shouldReconnect) {
+          console.log("🔄 Reconnecting in 30 seconds...");
+          setTimeout(() => startBot().catch(() => {}), 30000);
         } else {
-          // Any other reason (including "Connection Terminated"): safe to auto-reconnect
-          console.log("🔄 Reconnecting in 5 seconds...");
-          setTimeout(() => startBot().catch(() => {}), 5000);
+          console.log("❌ Logged out. Delete auth_info folder and re-scan QR.");
         }
       }
 
@@ -506,7 +497,7 @@ async function startBot() {
 
   } catch (e) {
     console.log("❌ Start error:", e.message);
-    setTimeout(() => startBot().catch(() => {}), 10000);
+    setTimeout(() => startBot().catch(() => {}), 60000); // Longer startup retry
   }
 }
 
