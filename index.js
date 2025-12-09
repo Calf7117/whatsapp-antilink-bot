@@ -264,7 +264,7 @@ async function startBot() {
       if (connection === "open") {
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║     ✅ ANTI-LINK BOT v2.5 ONLINE        ║");
+        console.log("║     ✅ ANTI-LINK BOT v2.6 ONLINE        ║");
         console.log("╠══════════════════════════════════════════╣");
         console.log("║  🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
         console.log("║  👑 Owner: " + ADMIN_NUMBER.padEnd(29) + "║");
@@ -280,23 +280,20 @@ async function startBot() {
 
       if (connection === "close") {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const errorMessage = String(lastDisconnect?.error?.message || "").toLowerCase();
+        const msg = lastDisconnect?.error?.message || "unknown";
 
-        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-        const isConflict =
-          statusCode === DisconnectReason.connectionReplaced ||
-          errorMessage.includes("conflict") ||
-          errorMessage.includes("replaced");
+        console.log("🔌 Connection closed:", msg, "code:", statusCode);
 
-        console.log("🔌 Connection closed:", lastDisconnect?.error?.message || "unknown");
-
-        if (isLoggedOut) {
+        if (statusCode === DisconnectReason.loggedOut) {
+          // Logged out: require fresh QR scan
           console.log("❌ Logged out. Delete auth_info folder and re-scan QR.");
-        } else if (isConflict) {
-          console.log("⚠️ Session conflict detected (account opened somewhere else).");
-          console.log("ℹ️ Bot will NOT auto-reconnect to avoid conflict loop.");
+        } else if (statusCode === DisconnectReason.connectionReplaced) {
+          // True session conflict (opened somewhere else): do NOT auto-reconnect to avoid loop
+          console.log("⚠️ Session conflict detected (connection replaced on another device).");
+          console.log("ℹ️ Bot will NOT auto-reconnect to avoid a conflict loop.");
           console.log("➡️ Close WhatsApp Web / other devices, then restart this bot manually.");
         } else {
+          // Any other reason (including "Connection Terminated"): safe to auto-reconnect
           console.log("🔄 Reconnecting in 5 seconds...");
           setTimeout(() => startBot().catch(() => {}), 5000);
         }
