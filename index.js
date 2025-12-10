@@ -1,6 +1,5 @@
 // index.js - Anti-Link Bot v2.8
-// - Based on your last known working version (B)
-// - Fixes: longer not-admin cache (1 hour) and stable reconnection
+// Pairing Code Login + ZIP file blocking + 1-hour not-admin cache
 
 const {
   default: makeWASocket,
@@ -13,24 +12,19 @@ const {
 const fs = require("fs");
 const path = require("path");
 
-// ---------- CONFIG ----------
-const ADMIN_NUMBER = "254106090661"; // Owner - fully exempt from all rules
-const DEBUG_MODE = true;             // Set true for verbose logging
-// ----------------------------
+const ADMIN_NUMBER = "254106090661";
+const DEBUG_MODE = true;
 
 const userViolations = new Map();
-
-// Duplicate/spam tracking
-const recentMessages = new Map();
-const DUP_WINDOW_MS = 30000; // 30s window
-const DUP_BLOCK_FROM = 2;    // from 2nd identical message in a row
-
-// Track groups where bot is not admin (to avoid useless delete attempts)
 const notAdminGroups = new Map();
-const NOT_ADMIN_CACHE_TTL = 60 * 60 * 1000; // 60 minutes (1 hour)
+const NOT_ADMIN_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
+const recentMessages = new Map();
+const DUP_WINDOW_MS = 30000;
+const DUP_BLOCK_FROM = 2;
 
 if (!fs.existsSync(path.join(__dirname, "auth_info"))) {
-  console.log("⚠️ auth_info not found — ensure your session files are in ./auth_info");
+  console.log("⚠️ auth_info not found — ensure session files are in ./auth_info");
 }
 
 const createSilentLogger = () => {
@@ -42,7 +36,6 @@ const createSilentLogger = () => {
   };
 };
 
-// Extract phone number from any JID format (s.whatsapp.net, lid, etc.)
 function extractPhoneNumber(jid) {
   if (!jid) return "";
   let clean = String(jid).split("@")[0];
@@ -50,7 +43,6 @@ function extractPhoneNumber(jid) {
   return clean.replace(/\D/g, "");
 }
 
-// Check if sender is the owner
 function isOwner(senderJid) {
   if (!senderJid) return false;
   const phone = extractPhoneNumber(senderJid);
@@ -58,8 +50,6 @@ function isOwner(senderJid) {
   if (String(senderJid).includes(ADMIN_NUMBER)) return true;
   return false;
 }
-
-// -------------- Detection helpers --------------
 
 function detectLinks(text) {
   if (!text) return false;
@@ -81,7 +71,6 @@ function isAPKFile(msg) {
   return msg.message?.documentMessage?.mimetype === "application/vnd.android.package-archive";
 }
 
-// NEW: ZIP file detection
 function isZipFile(msg) {
   const doc = msg.message?.documentMessage;
   if (!doc) return false;
@@ -245,8 +234,6 @@ function cleanupCaches() {
   }
 }
 
-// -------------- Bot startup --------------
-
 async function startBot() {
   try {
     const { state, saveCreds } = await useMultiFileAuthState("auth_info");
@@ -269,6 +256,26 @@ async function startBot() {
       msgRetryCounterCache: new Map(),
     });
 
+    if (!state.creds.me) {
+      try {
+        const code = await sock.requestPairingCode(ADMIN_NUMBER);
+        console.log("");
+        console.log("╔════════════════════════════════════════╗");
+        console.log("║ 📱 PAIRING CODE (Valid for 1 minute)  ║");
+        console.log("╠════════════════════════════════════════╣");
+        console.log("║ " + code.padEnd(36) + " ║");
+        console.log("╠════════════════════════════════════════╣");
+        console.log("║ 1. Open WhatsApp on your phone         ║");
+        console.log("║ 2. Go to: Settings → Linked Devices   ║");
+        console.log("║ 3. Tap 'Link a device'                 ║");
+        console.log("║ 4. Enter the 8-digit code above        ║");
+        console.log("╚════════════════════════════════════════╝");
+        console.log("");
+      } catch (e) {
+        console.log("⚠️ Pairing code request error:", e?.message);
+      }
+    }
+
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
@@ -277,17 +284,18 @@ async function startBot() {
       if (connection === "open") {
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║ ✅ ANTI-LINK BOT v2.7 ONLINE             ║");
+        console.log("║ ✅ ANTI-LINK BOT v2.8 ONLINE            ║");
         console.log("╠══════════════════════════════════════════╣");
         console.log("║ 🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
         console.log("║ 👑 Owner: " + ADMIN_NUMBER.padEnd(30) + "║");
         console.log("║ 📋 Mode: All groups (try & catch)        ║");
-        console.log("║ 🔧 !bot works for owner                  ║");
+        console.log("║ ⏱️ Not-admin cache: 1 hour              ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
         console.log("✅ Bot will process ALL groups.");
         console.log("✅ Messages deleted for EVERYONE (not just sender).");
         console.log("✅ Owner can use !bot command.");
+        console.log("✅ ZIP files are now violations.");
         console.log("");
       }
 
@@ -296,10 +304,10 @@ async function startBot() {
         const shouldReconnect = code !== DisconnectReason.loggedOut;
         console.log("🔌 Connection closed:", lastDisconnect?.error?.message || "unknown");
         if (shouldReconnect) {
-          console.log("🔄 Reconnecting in 10 seconds...");
-          setTimeout(() => startBot().catch(() => {}), 10000);
+          console.log("🔄 Reconnecting in 5 seconds...");
+          setTimeout(() => startBot().catch(() => {}), 5000);
         } else {
-          console.log("❌ Logged out. Delete auth_info folder and re-scan QR.");
+          console.log("❌ Logged out. Delete auth_info folder and re-scan.");
         }
       }
 
@@ -308,7 +316,6 @@ async function startBot() {
       }
     });
 
-    // Delete message for EVERYONE with retry & not-admin cache
     async function safeDelete(groupJid, msgKey) {
       const notAdmin = notAdminGroups.get(groupJid);
       if (notAdmin && (Date.now() - notAdmin) < NOT_ADMIN_CACHE_TTL) {
@@ -329,13 +336,13 @@ async function startBot() {
           console.log("⚠️ Delete error (attempt " + attempt + "):", errMsg);
 
           if (errMsg.includes("rate-overlimit")) {
-            delay = 2000 * attempt; // 2s, 4s, 6s backoff
+            delay = 2000 * attempt;
             continue;
           }
 
           if (errMsg.includes("forbidden") || errMsg.includes("not-authorized") || errMsg.includes("403")) {
             notAdminGroups.set(groupJid, Date.now());
-            console.log("📝 Bot is not admin in this group - caching for 10 min");
+            console.log("📝 Bot is not admin in this group - caching for 1 hour");
           }
 
           break;
@@ -366,15 +373,14 @@ async function startBot() {
         const visibleText = extractVisibleText(msg).trim();
         const textLower = visibleText.toLowerCase();
 
-        // ✅ CHECK FOR !bot COMMAND FIRST (BEFORE fromMe FILTER)
         if (textLower === "!bot") {
           console.log("📨 !bot command from:", senderJid);
-          const ownerCheck = isOwner(senderJid);
           try {
             let responseText = "✅ ANTI-LINK BOT v2.7 ACTIVE\n";
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
-            responseText += "📋 Mode: All groups (try & catch)\n";
-            if (ownerCheck) {
+            responseText += "📋 Mode: All groups (try & catch, Baby!)\n";
+            responseText += "⏱️ Not-admin cache: 1 hour\n";
+            if (isOwner(senderJid)) {
               responseText += "🔑 You are the owner - you are exempt from all rules";
             }
             await sock.sendMessage(groupJid, { text: responseText });
@@ -385,22 +391,19 @@ async function startBot() {
           return;
         }
 
-        // ✅ NOW SKIP IF MESSAGE IS FROM BOT ITSELF (AFTER !bot check)
         if (msg.key.fromMe) return;
 
-        // Owner is ALWAYS exempt from violations
         if (isOwner(senderJid)) {
           if (DEBUG_MODE) console.log("👑 Owner message - exempt from rules");
           return;
         }
 
-        // Check for violations
         const dup = checkDuplicate(groupJid, senderJid, visibleText);
         const hasLink = detectLinks(visibleText);
         const hasPhone = detectPhoneNumbers(visibleText);
         const business = isBusinessPost(msg);
         const apk = isAPKFile(msg);
-        const zip = isZipFile(msg); // NEW zip check
+        const zip = isZipFile(msg);
         const keyword = detectKeyword(visibleText);
         const buttons = hasButtons(msg);
         const contact = isContactMessage(msg);
@@ -442,7 +445,6 @@ async function startBot() {
             const removed = await safeRemove(groupJid, senderJid);
             if (removed) {
               userViolations.delete(userKey);
-              recentMessages.delete(userKey);
               console.log("❌ User removed after 3 violations");
             }
           }
@@ -455,7 +457,6 @@ async function startBot() {
       }
     }
 
-    // Message event - direct handling (no heavy custom queue)
     sock.ev.on("messages.upsert", async (m) => {
       const messages = m.messages || [];
 
@@ -475,7 +476,7 @@ async function startBot() {
       cleanupCaches();
     }, 30000);
 
-    console.log("🚀 Bot initialized - connecting to WhatsApp...");
+    console.log("🚀 Bot initialized - waiting for connection...");
   } catch (e) {
     console.log("❌ Start error:", e.message);
     setTimeout(() => startBot().catch(() => {}), 60000);
