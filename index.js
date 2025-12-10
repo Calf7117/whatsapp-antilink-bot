@@ -1,6 +1,6 @@
-// index.js - Anti-Link Bot v2.7
-// - Based on your last known working version (B)
-// - Fixes: shorter reconnect delay (5s) and ZIP file blocking
+// index.js - Anti-Link Bot v2.6
+// FIXED: !bot command works for owner, Delete for EVERYONE
+// Key fix: !bot check is BEFORE fromMe filter so owner can use it
 
 const {
   default: makeWASocket,
@@ -19,15 +19,17 @@ const DEBUG_MODE = true;             // Set true for verbose logging
 // ----------------------------
 
 const userViolations = new Map();
+const messageQueue = [];
+let isProcessing = false;
 
 // Duplicate/spam tracking
 const recentMessages = new Map();
-const DUP_WINDOW_MS = 30000; // 30s window
-const DUP_BLOCK_FROM = 2;    // from 2nd identical message in a row
+const DUP_WINDOW_MS = 30000;
+const DUP_BLOCK_FROM = 2;
 
-// Track groups where bot is not admin (to avoid useless delete attempts)
+// Track groups where bot is not admin
 const notAdminGroups = new Map();
-const NOT_ADMIN_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+const NOT_ADMIN_CACHE_TTL = 10 * 60 * 1000;
 
 if (!fs.existsSync(path.join(__dirname, "auth_info"))) {
   console.log("⚠️ auth_info not found — ensure your session files are in ./auth_info");
@@ -42,7 +44,7 @@ const createSilentLogger = () => {
   };
 };
 
-// Extract phone number from any JID format (s.whatsapp.net, lid, etc.)
+// Extract phone number from JID
 function extractPhoneNumber(jid) {
   if (!jid) return "";
   let clean = String(jid).split("@")[0];
@@ -55,12 +57,11 @@ function isOwner(senderJid) {
   if (!senderJid) return false;
   const phone = extractPhoneNumber(senderJid);
   if (phone === ADMIN_NUMBER) return true;
-  if (String(senderJid).includes(ADMIN_NUMBER)) return true;
+  if (senderJid.includes(ADMIN_NUMBER)) return true;
   return false;
 }
 
-// -------------- Detection helpers --------------
-
+// Detection functions
 function detectLinks(text) {
   if (!text) return false;
   const patterns = [
@@ -81,16 +82,6 @@ function isAPKFile(msg) {
   return msg.message?.documentMessage?.mimetype === "application/vnd.android.package-archive";
 }
 
-// NEW: ZIP file detection
-function isZipFile(msg) {
-  const doc = msg.message?.documentMessage;
-  if (!doc) return false;
-  if (doc.mimetype === "application/zip") return true;
-  const fileName = (doc.fileName || doc.title || "").toLowerCase();
-  if (fileName.endsWith(".zip")) return true;
-  return false;
-}
-
 function isBusinessPost(msg) {
   const p = msg.message?.productMessage;
   const c = msg.message?.catalogMessage;
@@ -100,17 +91,14 @@ function isBusinessPost(msg) {
     const src = String(ext.sourceUrl || "");
     if (/\b(?:wa\.me|whatsapp\.com)\/(?:catalog|c)\/?/i.test(src)) return true;
   }
-
   if (p) {
     const prod = p.product || {};
     if (prod.productImage || prod.title || prod.description || prod.currency || prod.priceAmount1000) return true;
   }
-
   if (c) {
     const cat = c.catalog || {};
     if (cat.title || (cat.products && cat.products.length > 0)) return true;
   }
-
   return false;
 }
 
@@ -245,8 +233,7 @@ function cleanupCaches() {
   }
 }
 
-// -------------- Bot startup --------------
-
+// Bot startup
 async function startBot() {
   try {
     const { state, saveCreds } = await useMultiFileAuthState("auth_info");
@@ -277,12 +264,12 @@ async function startBot() {
       if (connection === "open") {
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║ ✅ ANTI-LINK BOT v2.7 ONLINE             ║");
+        console.log("║     ✅ ANTI-LINK BOT v2.6 ONLINE        ║");
         console.log("╠══════════════════════════════════════════╣");
-        console.log("║ 🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
-        console.log("║ 👑 Owner: " + ADMIN_NUMBER.padEnd(30) + "║");
-        console.log("║ 📋 Mode: All groups (try & catch)        ║");
-        console.log("║ 🔧 !bot works for owner                  ║");
+        console.log("║  🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
+        console.log("║  👑 Owner: " + ADMIN_NUMBER.padEnd(29) + "║");
+        console.log("║  📋 Mode: All groups (try & catch)       ║");
+        console.log("║  🔧 !bot now works for owner            ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
         console.log("✅ Bot will process ALL groups.");
@@ -296,8 +283,8 @@ async function startBot() {
         const shouldReconnect = code !== DisconnectReason.loggedOut;
         console.log("🔌 Connection closed:", lastDisconnect?.error?.message || "unknown");
         if (shouldReconnect) {
-          console.log("🔄 Reconnecting in 5 seconds...");
-          setTimeout(() => startBot().catch(() => {}), 5000);
+          console.log("🔄 Reconnecting in 30 seconds...");
+          setTimeout(() => startBot().catch(() => {}), 30000);
         } else {
           console.log("❌ Logged out. Delete auth_info folder and re-scan QR.");
         }
@@ -308,42 +295,43 @@ async function startBot() {
       }
     });
 
-    // Delete message for EVERYONE with retry & not-admin cache
+    // Delete message for EVERYONE with retry
     async function safeDelete(groupJid, msgKey) {
       const notAdmin = notAdminGroups.get(groupJid);
       if (notAdmin && (Date.now() - notAdmin) < NOT_ADMIN_CACHE_TTL) {
-        if (DEBUG_MODE) console.log("⏭️ Skipping delete - cached as not admin for this group");
+        if (DEBUG_MODE) console.log("⏭️ Skipping delete - cached as not admin");
         return false;
       }
 
-      const maxAttempts = 3;
-      let delay = 0;
-
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        if (delay) await new Promise(r => setTimeout(r, delay));
-        try {
-          await sock.sendMessage(groupJid, { delete: msgKey });
-          return true;
-        } catch (e) {
-          const errMsg = String(e?.message || e || "");
-          console.log("⚠️ Delete error (attempt " + attempt + "):", errMsg);
-
-          if (errMsg.includes("rate-overlimit")) {
-            delay = 2000 * attempt; // 2s, 4s, 6s backoff
-            continue;
+      try {
+        await sock.sendMessage(groupJid, { delete: msgKey });
+        return true;
+      } catch (e) {
+        const errMsg = String(e?.message || e || "");
+        console.log("⚠️ Delete error:", errMsg);
+        
+        if (errMsg.includes("rate-overlimit")) {
+          console.log("⏳ Rate limited, waiting 3 seconds...");
+          await new Promise(r => setTimeout(r, 3000));
+          try {
+            await sock.sendMessage(groupJid, { delete: msgKey });
+            return true;
+          } catch (e2) {
+            console.log("⚠️ Retry failed:", e2?.message);
+            return false;
           }
-
-          if (errMsg.includes("forbidden") || errMsg.includes("not-authorized") || errMsg.includes("403")) {
-            notAdminGroups.set(groupJid, Date.now());
-            console.log("📝 Bot is not admin in this group - caching for 10 min");
-          }
-
-          break;
         }
+        
+        if (errMsg.includes("forbidden") || errMsg.includes("not-authorized") || errMsg.includes("403")) {
+          notAdminGroups.set(groupJid, Date.now());
+          console.log("📝 Bot is not admin in this group - caching for 10 min");
+        }
+        
+        return false;
       }
-      return false;
     }
 
+    // Remove user from group
     async function safeRemove(groupJid, userJid) {
       try {
         await sock.groupParticipantsUpdate(groupJid, [userJid], "remove");
@@ -355,6 +343,7 @@ async function startBot() {
       }
     }
 
+    // Main message handler
     async function handleMessage(msg) {
       try {
         if (!msg?.key?.remoteJid?.endsWith("@g.us")) return;
@@ -371,11 +360,11 @@ async function startBot() {
           console.log("📨 !bot command from:", senderJid);
           const ownerCheck = isOwner(senderJid);
           try {
-            let responseText = "✅ ANTI-LINK BOT v2.7 ACTIVE\n";
+            let responseText = "✅ ANTI-LINK BOT v2.6 ACTIVE\n";
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
-            responseText += "📋 Mode: All groups (try & catch)\n";
+            responseText += "📋 Monitoring this group\n";
             if (ownerCheck) {
-              responseText += "🔑 You are the owner, Baby! - you are exempt from all rules";
+              responseText += "🔑 You are the owner - you are exempt from all rules";
             }
             await sock.sendMessage(groupJid, { text: responseText });
             console.log("✅ Sent !bot response");
@@ -400,25 +389,25 @@ async function startBot() {
         const hasPhone = detectPhoneNumbers(visibleText);
         const business = isBusinessPost(msg);
         const apk = isAPKFile(msg);
-        const zip = isZipFile(msg); // NEW zip check
         const keyword = detectKeyword(visibleText);
         const buttons = hasButtons(msg);
         const contact = isContactMessage(msg);
 
-        const violated = dup.isDuplicate || hasLink || hasPhone || business || apk || zip || keyword || buttons || contact;
+        const violated = dup.isDuplicate || hasLink || hasPhone || business || apk || keyword || buttons || contact;
         if (!violated) return;
 
+        // Build reason string
         const reasons = [];
         if (dup.isDuplicate) reasons.push("duplicate(x" + dup.count + ")");
         if (hasLink) reasons.push("link");
         if (hasPhone) reasons.push("phone");
         if (business) reasons.push("business");
         if (apk) reasons.push("apk");
-        if (zip) reasons.push("zip");
         if (keyword) reasons.push("keyword");
         if (buttons) reasons.push("buttons");
         if (contact) reasons.push("contact");
 
+        // Track violations
         const userKey = groupJid + "-" + senderJid;
         const current = userViolations.get(userKey) || 0;
         const updated = current + 1;
@@ -426,16 +415,19 @@ async function startBot() {
 
         console.log("");
         console.log("🚫 VIOLATION DETECTED");
-        console.log("User: " + senderJid);
-        console.log("Group: " + groupJid);
-        console.log("Reason: " + reasons.join(", "));
-        console.log("Strike: " + updated + "/3");
-        console.log("Text: " + visibleText.substring(0, 150));
+        console.log("   User: " + senderJid);
+        console.log("   Group: " + groupJid);
+        console.log("   Reason: " + reasons.join(", "));
+        console.log("   Strike: " + updated + "/3");
+        console.log("   Text: " + visibleText.substring(0, 100));
 
+        // Try to delete message for EVERYONE
         const deleted = await safeDelete(groupJid, msg.key);
+        
         if (deleted) {
           console.log("✅ Message deleted for EVERYONE");
-
+          
+          // Remove on 3rd strike
           if (updated >= 3) {
             console.log("⚠️ User reached 3 strikes - removing from group...");
             await new Promise(r => setTimeout(r, 500));
@@ -455,30 +447,57 @@ async function startBot() {
       }
     }
 
-    // Message event - direct handling (no heavy custom queue)
+    // Process queue
+    async function processQueue() {
+      if (isProcessing || messageQueue.length === 0) return;
+      isProcessing = true;
+
+      const batchSize = 8;
+      let processed = 0;
+
+      while (messageQueue.length > 0 && processed < batchSize) {
+        const msg = messageQueue.shift();
+        await handleMessage(msg);
+        processed++;
+        await new Promise(r => setTimeout(r, 300));
+      }
+
+      isProcessing = false;
+      
+      if (messageQueue.length > 0) {
+        setTimeout(processQueue, 500);
+      }
+    }
+
+    // Message event
     sock.ev.on("messages.upsert", async (m) => {
       const messages = m.messages || [];
-
+      
       for (const msg of messages) {
         if (!msg?.key?.remoteJid?.endsWith("@g.us")) continue;
         if (!msg.message) continue;
-
+        
         if (DEBUG_MODE && !msg.key.fromMe) {
           console.log("📩 New message in:", msg.key.remoteJid.substring(0, 20) + "...");
         }
-
-        handleMessage(msg).catch(() => {});
+        
+        messageQueue.push(msg);
       }
+      
+      processQueue();
     });
 
+    // Periodic cleanup
     setInterval(() => {
       cleanupCaches();
+      if (messageQueue.length > 0) processQueue();
     }, 30000);
 
     console.log("🚀 Bot initialized - connecting to WhatsApp...");
+
   } catch (e) {
     console.log("❌ Start error:", e.message);
-    setTimeout(() => startBot().catch(() => {}), 60000);
+    setTimeout(() => startBot().catch(() => {}), 60000); // Longer startup retry
   }
 }
 
