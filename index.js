@@ -1,5 +1,6 @@
-// index.js - Anti-Link Bot v2.8
+// index.js - Anti-Link Bot v2.7
 // Pairing Code Login + ZIP file blocking + 1-hour not-admin cache
+// FIXED: Pairing code flow now waits properly for you to enter the code
 
 const {
   default: makeWASocket,
@@ -23,9 +24,8 @@ const recentMessages = new Map();
 const DUP_WINDOW_MS = 30000;
 const DUP_BLOCK_FROM = 2;
 
-if (!fs.existsSync(path.join(__dirname, "auth_info"))) {
-  console.log("⚠️ auth_info not found — ensure session files are in ./auth_info");
-}
+// Track if we've ever successfully connected (for pairing flow)
+let hasConnectedBefore = false;
 
 const createSilentLogger = () => {
   const noOp = () => {};
@@ -250,29 +250,41 @@ async function startBot() {
       generateHighQualityLinkPreview: false,
       retryRequestDelayMs: 2000,
       maxRetries: 5,
-      connectTimeoutMs: 30000,
-      keepAliveIntervalMs: 15000,
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 30000,
       getMessage: async () => undefined,
       msgRetryCounterCache: new Map(),
     });
 
-    if (!state.creds.me) {
+    // Request pairing code if not registered
+    if (!state.creds.registered) {
+      console.log("");
+      console.log("📱 Requesting pairing code for: " + ADMIN_NUMBER);
+      console.log("⏳ Please wait...");
+      
+      // Small delay to let connection establish
+      await new Promise(r => setTimeout(r, 3000));
+      
       try {
         const code = await sock.requestPairingCode(ADMIN_NUMBER);
         console.log("");
         console.log("╔════════════════════════════════════════╗");
-        console.log("║ 📱 PAIRING CODE (Valid for 1 minute)  ║");
+        console.log("║ 📱 PAIRING CODE (Valid for 60 seconds) ║");
         console.log("╠════════════════════════════════════════╣");
-        console.log("║ " + code.padEnd(36) + " ║");
+        console.log("║                                        ║");
+        console.log("║     " + code + "                         ║");
+        console.log("║                                        ║");
         console.log("╠════════════════════════════════════════╣");
         console.log("║ 1. Open WhatsApp on your phone         ║");
-        console.log("║ 2. Go to: Settings → Linked Devices   ║");
-        console.log("║ 3. Tap 'Link a device'                 ║");
+        console.log("║ 2. Go to: Settings → Linked Devices    ║");
+        console.log("║ 3. Tap 'Link a Device'                 ║");
         console.log("║ 4. Enter the 8-digit code above        ║");
         console.log("╚════════════════════════════════════════╝");
         console.log("");
+        console.log("⏳ Waiting for you to enter the code...");
       } catch (e) {
-        console.log("⚠️ Pairing code request error:", e?.message);
+        console.log("⚠️ Pairing code error:", e?.message);
+        console.log("🔄 Will retry in 10 seconds...");
       }
     }
 
@@ -282,14 +294,15 @@ async function startBot() {
       const { connection, lastDisconnect, qr } = update;
 
       if (connection === "open") {
+        hasConnectedBefore = true;
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║ ✅ ANTI-LINK BOT v2.8 ONLINE            ║");
+        console.log("║ ✅ ANTI-LINK BOT v2.7 ONLINE            ║");
         console.log("╠══════════════════════════════════════════╣");
         console.log("║ 🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
         console.log("║ 👑 Owner: " + ADMIN_NUMBER.padEnd(30) + "║");
         console.log("║ 📋 Mode: All groups (try & catch)        ║");
-        console.log("║ ⏱️ Not-admin cache: 1 hour              ║");
+        console.log("║ ⏱️ Not-admin cache: 1 hour               ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
         console.log("✅ Bot will process ALL groups.");
@@ -300,19 +313,29 @@ async function startBot() {
       }
 
       if (connection === "close") {
-        const code = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = code !== DisconnectReason.loggedOut;
-        console.log("🔌 Connection closed:", lastDisconnect?.error?.message || "unknown");
-        if (shouldReconnect) {
-          console.log("🔄 Reconnecting in 5 seconds...");
-          setTimeout(() => startBot().catch(() => {}), 5000);
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const reason = lastDisconnect?.error?.message || "unknown";
+        
+        console.log("🔌 Connection closed: " + reason);
+        
+        // Only treat as "logged out" if:
+        // 1. We've connected before AND
+        // 2. The status code is specifically "loggedOut"
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+        
+        if (isLoggedOut && hasConnectedBefore) {
+          console.log("❌ Logged out. Delete auth_info folder and restart.");
         } else {
-          console.log("❌ Logged out. Delete auth_info folder and re-scan.");
+          // Always reconnect during pairing or normal disconnects
+          const delay = hasConnectedBefore ? 5000 : 10000;
+          console.log("🔄 Reconnecting in " + (delay/1000) + " seconds...");
+          setTimeout(() => startBot().catch(console.error), delay);
         }
       }
 
       if (qr) {
-        console.log("📱 QR Code received - scan with WhatsApp to login");
+        console.log("📱 QR Code received - but we're using pairing code instead");
+        console.log("⏳ If you see this, wait for pairing code or restart bot");
       }
     });
 
@@ -373,6 +396,7 @@ async function startBot() {
         const visibleText = extractVisibleText(msg).trim();
         const textLower = visibleText.toLowerCase();
 
+        // !bot command - check BEFORE fromMe filter
         if (textLower === "!bot") {
           console.log("📨 !bot command from:", senderJid);
           try {
@@ -391,8 +415,10 @@ async function startBot() {
           return;
         }
 
+        // Skip messages from bot itself (except !bot which was handled above)
         if (msg.key.fromMe) return;
 
+        // Owner is exempt from violations
         if (isOwner(senderJid)) {
           if (DEBUG_MODE) console.log("👑 Owner message - exempt from rules");
           return;
@@ -479,7 +505,8 @@ async function startBot() {
     console.log("🚀 Bot initialized - waiting for connection...");
   } catch (e) {
     console.log("❌ Start error:", e.message);
-    setTimeout(() => startBot().catch(() => {}), 60000);
+    console.log("🔄 Retrying in 30 seconds...");
+    setTimeout(() => startBot().catch(() => {}), 30000);
   }
 }
 
