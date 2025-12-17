@@ -1,3 +1,20 @@
+// ==================== HEALTH CHECK SERVER (ADDED) ====================
+// This tiny server ONLY responds to pings - doesn't touch your bot's functionality
+// It keeps Render from sleeping your bot on free tier
+const http = require('http');
+const healthServer = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('🤖 Anti-Link Bot v2.7 is ONLINE\nOwner: 254106090661');
+});
+
+// Listen on Render's provided port OR default to 8080
+const PORT = process.env.PORT || 8080;
+healthServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`[Health] Server ready for pings on port ${PORT}`);
+});
+// ==================== END HEALTH CHECK ====================
+
+// ==================== YOUR ORIGINAL BOT CODE (UNCHANGED) ====================
 // index.js - Anti-Link Bot v2.7
 // Pairing Code Login + ZIP file blocking + 1-hour not-admin cache
 // FIXED: Pairing code flow now waits properly for you to enter the code
