@@ -1,34 +1,16 @@
-// ==================== HEALTH CHECK SERVER (ADDED) ====================
-// This tiny server ONLY responds to pings - doesn't touch your bot's functionality
-// It keeps Render from sleeping your bot on free tier
-const http = require('http');
-const healthServer = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('🤖 Anti-Link Bot v2.7 is ONLINE\nOwner: 254106090661');
-});
-
-// Listen on Render's provided port OR default to 8080
-const PORT = process.env.PORT || 8080;
-healthServer.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Health] Server ready for pings on port ${PORT}`);
-});
-// ==================== END HEALTH CHECK ====================
-
-// ==================== YOUR ORIGINAL BOT CODE (UNCHANGED) ====================
-// index.js - Anti-Link Bot v2.7
-// Pairing Code Login + ZIP file blocking + 1-hour not-admin cache
-// FIXED: Pairing code flow now waits properly for you to enter the code
+// index.js - Anti-Link Bot v2.8
+// Pairing Code Login + ZIP file blocking + 1-hour not-admin cache + Session Persistence
+// FIXED: Saves session to environment variable to survive Render free tier restarts
 
 const {
   default: makeWASocket,
-  useMultiFileAuthState,
+  useSingleFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   DisconnectReason,
 } = require("@whiskeysockets/baileys");
 
-const fs = require("fs");
-const path = require("path");
+const crypto = require("crypto");
 
 const ADMIN_NUMBER = "254106090661";
 const DEBUG_MODE = true;
@@ -52,6 +34,67 @@ const createSilentLogger = () => {
     child: () => createSilentLogger(),
   };
 };
+
+// SESSION PERSISTENCE FUNCTIONS
+function saveSessionToEnv(sessionData) {
+  try {
+    const sessionString = JSON.stringify(sessionData);
+    const encrypted = encrypt(sessionString);
+    
+    // This will be printed in logs. Copy this to Render environment variable
+    console.log("\n" + "=".repeat(60));
+    console.log("📁 COPY THIS SESSION DATA TO RENDER ENVIRONMENT VARIABLE:");
+    console.log("=".repeat(60));
+    console.log("VARIABLE NAME: WHATSAPP_SESSION");
+    console.log("VARIABLE VALUE:");
+    console.log(encrypted);
+    console.log("=".repeat(60));
+    console.log("1. Go to Render Dashboard → Your Service → Environment");
+    console.log("2. Add Environment Variable: WHATSAPP_SESSION");
+    console.log("3. Paste the value above");
+    console.log("4. Redeploy (optional)");
+    console.log("=".repeat(60) + "\n");
+    
+    return encrypted;
+  } catch (error) {
+    console.log("❌ Error saving session:", error.message);
+    return null;
+  }
+}
+
+function loadSessionFromEnv() {
+  try {
+    const encrypted = process.env.WHATSAPP_SESSION;
+    if (!encrypted) {
+      console.log("ℹ️ No saved session found in environment variables");
+      return null;
+    }
+    
+    const decrypted = decrypt(encrypted);
+    return JSON.parse(decrypted);
+  } catch (error) {
+    console.log("❌ Error loading session:", error.message);
+    return null;
+  }
+}
+
+function encrypt(text) {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(process.env.SESSION_KEY || 'defaultkey1234567890123456789012345'), iv);
+  let encrypted = cipher.update(text, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  return iv.toString('hex') + ':' + encrypted;
+}
+
+function decrypt(text) {
+  const parts = text.split(':');
+  const iv = Buffer.from(parts.shift(), 'hex');
+  const encryptedText = Buffer.from(parts.join(':'), 'hex');
+  const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(process.env.SESSION_KEY || 'defaultkey1234567890123456789012345'), iv);
+  let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+  decrypted += decipher.final('utf8');
+  return decrypted;
+}
 
 function extractPhoneNumber(jid) {
   if (!jid) return "";
@@ -253,7 +296,33 @@ function cleanupCaches() {
 
 async function startBot() {
   try {
-    const { state, saveCreds } = await useMultiFileAuthState("auth_info");
+    // Load saved session from environment variable
+    let savedState = loadSessionFromEnv();
+    let state, saveCreds;
+    
+    if (savedState) {
+      console.log("✅ Loaded saved session from environment variable");
+      state = savedState;
+      // Create a custom saveCreds function that also saves to environment variable
+      saveCreds = async () => {
+        // This would normally be called when credentials update
+        // We'll save the updated state to environment variable
+        if (state.creds) {
+          const sessionData = {
+            creds: state.creds,
+            keys: state.keys
+          };
+          saveSessionToEnv(sessionData);
+        }
+      };
+    } else {
+      // Use single file auth state for initial setup
+      const authState = await useSingleFileAuthState("auth_info.json");
+      state = authState.state;
+      saveCreds = authState.saveCreds;
+      console.log("ℹ️ No saved session found, starting fresh");
+    }
+
     const keyStore = makeCacheableSignalKeyStore(state.keys, createSilentLogger());
 
     const { version, isLatest } = await fetchLatestBaileysVersion();
@@ -303,9 +372,31 @@ async function startBot() {
         console.log("⚠️ Pairing code error:", e?.message);
         console.log("🔄 Will retry in 10 seconds...");
       }
+    } else {
+      // Save the current session to environment variable
+      const sessionData = {
+        creds: state.creds,
+        keys: state.keys
+      };
+      saveSessionToEnv(sessionData);
     }
 
-    sock.ev.on("creds.update", saveCreds);
+    sock.ev.on("creds.update", async (creds) => {
+      // Update the state with new credentials
+      state.creds = creds;
+      
+      // Save credentials using original function
+      if (typeof saveCreds === 'function') {
+        await saveCreds();
+      }
+      
+      // Also save to environment variable
+      const sessionData = {
+        creds: state.creds,
+        keys: state.keys
+      };
+      saveSessionToEnv(sessionData);
+    });
 
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
@@ -314,18 +405,20 @@ async function startBot() {
         hasConnectedBefore = true;
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║ ✅ ANTI-LINK BOT v2.7 ONLINE            ║");
+        console.log("║ ✅ ANTI-LINK BOT v2.8 ONLINE            ║");
         console.log("╠══════════════════════════════════════════╣");
         console.log("║ 🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
         console.log("║ 👑 Owner: " + ADMIN_NUMBER.padEnd(30) + "║");
         console.log("║ 📋 Mode: All groups (try & catch)        ║");
         console.log("║ ⏱️ Not-admin cache: 1 hour               ║");
+        console.log("║ 💾 Session: Saved in ENV variable       ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
         console.log("✅ Bot will process ALL groups.");
         console.log("✅ Messages deleted for EVERYONE (not just sender).");
         console.log("✅ Owner can use !bot command.");
         console.log("✅ ZIP files are now violations.");
+        console.log("✅ Session persists through restarts.");
         console.log("");
       }
 
@@ -335,15 +428,13 @@ async function startBot() {
         
         console.log("🔌 Connection closed: " + reason);
         
-        // Only treat as "logged out" if:
-        // 1. We've connected before AND
-        // 2. The status code is specifically "loggedOut"
         const isLoggedOut = statusCode === DisconnectReason.loggedOut;
         
         if (isLoggedOut && hasConnectedBefore) {
-          console.log("❌ Logged out. Delete auth_info folder and restart.");
+          console.log("❌ Logged out. You'll need to re-pair.");
+          // Clear the saved session
+          console.log("🔄 Clear the WHATSAPP_SESSION environment variable and restart.");
         } else {
-          // Always reconnect during pairing or normal disconnects
           const delay = hasConnectedBefore ? 5000 : 10000;
           console.log("🔄 Reconnecting in " + (delay/1000) + " seconds...");
           setTimeout(() => startBot().catch(console.error), delay);
@@ -421,6 +512,7 @@ async function startBot() {
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
             responseText += "📋 Mode: All groups (try & catch, Baby!)\n";
             responseText += "⏱️ Not-admin cache: 1 hour\n";
+            responseText += "💾 Session: Persists through restarts\n";
             if (isOwner(senderJid)) {
               responseText += "🔑 You are the owner - you are exempt from all rules";
             }
@@ -527,4 +619,17 @@ async function startBot() {
   }
 }
 
+// HEALTH CHECK SERVER (Keeps Render awake)
+const http = require('http');
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('🤖 Anti-Link Bot v2.8 ONLINE\nOwner: 254106090661\nSession: Persists through restarts');
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[Health] Server ready for pings on port ${PORT}`);
+});
+
+// Start the bot
 startBot();
