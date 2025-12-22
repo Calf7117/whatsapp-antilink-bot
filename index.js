@@ -1,10 +1,10 @@
-// index.js - Anti-Link Bot v2.8
+// index.js - Anti-Link Bot v2.8 (CORRECTED)
 // Pairing Code Login + ZIP file blocking + 1-hour not-admin cache + Session Persistence
-// FIXED: Saves session to environment variable to survive Render free tier restarts
+// FIXED: Uses 'useMultiFileAuthState' which is the CORRECT function.
 
 const {
   default: makeWASocket,
-  useSingleFileAuthState,
+  useMultiFileAuthState, // ✅ CORRECTED LINE (was 'useSingleFileAuthState')
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   DisconnectReason,
@@ -296,33 +296,9 @@ function cleanupCaches() {
 
 async function startBot() {
   try {
-    // Load saved session from environment variable
-    let savedState = loadSessionFromEnv();
-    let state, saveCreds;
-    
-    if (savedState) {
-      console.log("✅ Loaded saved session from environment variable");
-      state = savedState;
-      // Create a custom saveCreds function that also saves to environment variable
-      saveCreds = async () => {
-        // This would normally be called when credentials update
-        // We'll save the updated state to environment variable
-        if (state.creds) {
-          const sessionData = {
-            creds: state.creds,
-            keys: state.keys
-          };
-          saveSessionToEnv(sessionData);
-        }
-      };
-    } else {
-      // Use single file auth state for initial setup
-      const authState = await useSingleFileAuthState("auth_info.json");
-      state = authState.state;
-      saveCreds = authState.saveCreds;
-      console.log("ℹ️ No saved session found, starting fresh");
-    }
-
+    // ✅ LOAD AUTH STATE CORRECTLY
+    // This replaces the problematic 'useSingleFileAuthState'
+    const { state, saveCreds } = await useMultiFileAuthState("auth_info");
     const keyStore = makeCacheableSignalKeyStore(state.keys, createSilentLogger());
 
     const { version, isLatest } = await fetchLatestBaileysVersion();
