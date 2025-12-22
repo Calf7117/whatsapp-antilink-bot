@@ -1,5 +1,6 @@
-// index.js - Anti-Link Bot v3.0
-// ✅ FIXED: Session persistence now actually works!
+// index.js - Anti-Link Bot v3.1 (FIXED PAIRING)
+// ✅ FIXED: Pairing code "check number" error
+// ✅ FIXED: Session persistence (restores on restart)
 // ✅ FIXED: Encryption key length (32 bytes)
 // ✅ ADDED: Audio file detection
 // ✅ Works with Render Free Web Service
@@ -16,7 +17,8 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
-const ADMIN_NUMBER = "254106090661";
+// ✅ SET YOUR NUMBER HERE OR USE ENV VARIABLE
+const ADMIN_NUMBER = process.env.ADMIN_NUMBER || "254106090661";
 const DEBUG_MODE = true;
 const AUTH_FOLDER = "./auth_info";
 
@@ -420,12 +422,28 @@ async function startBot() {
     if (!state.creds.registered) {
       console.log("");
       console.log("📱 New device - requesting pairing code for: " + ADMIN_NUMBER);
-      console.log("⏳ Please wait...");
+      console.log("⏳ Please wait 5 seconds before requesting code...");
 
-      await new Promise(r => setTimeout(r, 3000));
+      // ✅ LONGER DELAY - helps avoid "check number" error
+      await new Promise(r => setTimeout(r, 5000));
 
-      try {
-        const code = await sock.requestPairingCode(ADMIN_NUMBER);
+      // ✅ RETRY LOGIC for pairing code
+      let code = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          console.log("📱 Requesting pairing code (attempt " + attempt + "/3)...");
+          code = await sock.requestPairingCode(ADMIN_NUMBER);
+          break; // Success!
+        } catch (e) {
+          console.log("⚠️ Attempt " + attempt + " failed:", e?.message);
+          if (attempt < 3) {
+            console.log("⏳ Waiting 10 seconds before retry...");
+            await new Promise(r => setTimeout(r, 10000));
+          }
+        }
+      }
+
+      if (code) {
         console.log("");
         console.log("╔════════════════════════════════════════╗");
         console.log("║ 📱 PAIRING CODE (Valid for 60 seconds) ║");
@@ -440,9 +458,15 @@ async function startBot() {
         console.log("║ 4. Enter the 8-digit code above        ║");
         console.log("╚════════════════════════════════════════╝");
         console.log("");
-      } catch (e) {
-        console.log("⚠️ Pairing code error:", e?.message);
-        console.log("🔄 Will retry in 10 seconds...");
+      } else {
+        console.log("");
+        console.log("❌ COULD NOT GET PAIRING CODE!");
+        console.log("📋 TROUBLESHOOTING:");
+        console.log("   1. Unlink ALL devices in WhatsApp → Linked Devices");
+        console.log("   2. Wait 5-10 minutes");
+        console.log("   3. Make sure ADMIN_NUMBER is correct: " + ADMIN_NUMBER);
+        console.log("   4. Restart the bot");
+        console.log("");
       }
     } else {
       console.log("✅ Found existing session, connecting...");
@@ -460,7 +484,7 @@ async function startBot() {
         hasConnectedBefore = true;
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║ ✅ ANTI-LINK BOT v3.0 ONLINE             ║");
+        console.log("║ ✅ ANTI-LINK BOT v3.1 ONLINE             ║");
         console.log("╠══════════════════════════════════════════╣");
         console.log("║ 🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(32) + "║");
         console.log("║ 👑 Owner: " + ADMIN_NUMBER.padEnd(30) + "║");
@@ -470,8 +494,11 @@ async function startBot() {
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
 
+        // ✅ Save session immediately AND after 5 seconds
+        console.log("💾 Saving session for future restarts...");
+        saveSessionToEnv();
         setTimeout(() => {
-          console.log("💾 Saving session for future restarts...");
+          console.log("💾 Saving session again (backup)...");
           saveSessionToEnv();
         }, 5000);
       }
@@ -485,11 +512,14 @@ async function startBot() {
         const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
         if (isLoggedOut) {
-          console.log("❌ Logged out! Clear WHATSAPP_SESSION env var and restart.");
+          console.log("❌ Logged out! Clearing session...");
           if (fs.existsSync(AUTH_FOLDER)) {
             fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
             console.log("🗑️ Cleared local auth files");
           }
+          console.log("⚠️ Delete WHATSAPP_SESSION env var in Render and redeploy!");
+          console.log("⚠️ Also unlink the device in WhatsApp → Linked Devices");
+          process.exit(1); // Stop bot - needs manual intervention
         } else {
           const delay = hasConnectedBefore ? 5000 : 10000;
           console.log("🔄 Reconnecting in " + (delay/1000) + " seconds...");
@@ -564,7 +594,7 @@ async function startBot() {
             let resp = "✅ ANTI-LINK BOT v3.0 ACTIVE\n";
             resp += "👑 Owner: " + ADMIN_NUMBER + "\n";
             resp += "📋 Mode: All groups\n";
-            resp += "💃 We R Gud Baby!!\n";
+            resp += "💃 We R 🆗 Baby!! 🤫\n";
             if (isOwner(senderJid)) resp += "🔑 You are the owner";
             await sock.sendMessage(groupJid, { text: resp });
           } catch (e) {}
@@ -648,7 +678,7 @@ const PORT = process.env.PORT || 3000;
 
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Anti-Link Bot v3.0 Running");
+  res.end("Anti-Link Bot v3.1 Running");
 }).listen(PORT, () => {
   console.log("🌐 Health check server on port " + PORT);
 });
