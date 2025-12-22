@@ -1,29 +1,28 @@
-// index.js - Anti-Link Bot v2.8 (CORRECTED)
-// Pairing Code Login + ZIP file blocking + 1-hour not-admin cache + Session Persistence
-// FIXED: Uses 'useMultiFileAuthState' which is the CORRECT function.
+// index.js - Anti-Link Bot v2.9 (CORRECTED)
+// FIXED: Removed broken custom session encryption causing "Invalid key length"
+// ADDED: Audio file detection as a violation
 
 const {
   default: makeWASocket,
-  useMultiFileAuthState, // ✅ CORRECTED LINE (was 'useSingleFileAuthState')
+  useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   DisconnectReason,
 } = require("@whiskeysockets/baileys");
 
-const crypto = require("crypto");
+// ✅ CHANGE 1: REMOVED the problematic 'crypto' import for session encryption.
 
 const ADMIN_NUMBER = "254106090661";
 const DEBUG_MODE = true;
 
 const userViolations = new Map();
 const notAdminGroups = new Map();
-const NOT_ADMIN_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+const NOT_ADMIN_CACHE_TTL = 60 * 60 * 1000;
 
 const recentMessages = new Map();
 const DUP_WINDOW_MS = 30000;
 const DUP_BLOCK_FROM = 2;
 
-// Track if we've ever successfully connected (for pairing flow)
 let hasConnectedBefore = false;
 
 const createSilentLogger = () => {
@@ -35,66 +34,9 @@ const createSilentLogger = () => {
   };
 };
 
-// SESSION PERSISTENCE FUNCTIONS
-function saveSessionToEnv(sessionData) {
-  try {
-    const sessionString = JSON.stringify(sessionData);
-    const encrypted = encrypt(sessionString);
-    
-    // This will be printed in logs. Copy this to Render environment variable
-    console.log("\n" + "=".repeat(60));
-    console.log("📁 COPY THIS SESSION DATA TO RENDER ENVIRONMENT VARIABLE:");
-    console.log("=".repeat(60));
-    console.log("VARIABLE NAME: WHATSAPP_SESSION");
-    console.log("VARIABLE VALUE:");
-    console.log(encrypted);
-    console.log("=".repeat(60));
-    console.log("1. Go to Render Dashboard → Your Service → Environment");
-    console.log("2. Add Environment Variable: WHATSAPP_SESSION");
-    console.log("3. Paste the value above");
-    console.log("4. Redeploy (optional)");
-    console.log("=".repeat(60) + "\n");
-    
-    return encrypted;
-  } catch (error) {
-    console.log("❌ Error saving session:", error.message);
-    return null;
-  }
-}
-
-function loadSessionFromEnv() {
-  try {
-    const encrypted = process.env.WHATSAPP_SESSION;
-    if (!encrypted) {
-      console.log("ℹ️ No saved session found in environment variables");
-      return null;
-    }
-    
-    const decrypted = decrypt(encrypted);
-    return JSON.parse(decrypted);
-  } catch (error) {
-    console.log("❌ Error loading session:", error.message);
-    return null;
-  }
-}
-
-function encrypt(text) {
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(process.env.SESSION_KEY || 'defaultkey1234567890123456789012345'), iv);
-  let encrypted = cipher.update(text, 'utf8', 'hex');
-  encrypted += cipher.final('hex');
-  return iv.toString('hex') + ':' + encrypted;
-}
-
-function decrypt(text) {
-  const parts = text.split(':');
-  const iv = Buffer.from(parts.shift(), 'hex');
-  const encryptedText = Buffer.from(parts.join(':'), 'hex');
-  const decipher = crypto.createDecipheriv('aes-256-cbc', Buffer.from(process.env.SESSION_KEY || 'defaultkey1234567890123456789012345'), iv);
-  let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
-  decrypted += decipher.final('utf8');
-  return decrypted;
-}
+// ✅ CHANGE 2: REMOVED the entire `saveSessionToEnv`, `loadSessionFromEnv`,
+// `encrypt`, and `decrypt` functions. They are not needed and cause the error.
+// The standard `useMultiFileAuthState` will handle session files correctly.
 
 function extractPhoneNumber(jid) {
   if (!jid) return "";
@@ -137,6 +79,27 @@ function isZipFile(msg) {
   if (doc.mimetype === "application/zip") return true;
   const fileName = (doc.fileName || doc.title || "").toLowerCase();
   if (fileName.endsWith(".zip")) return true;
+  return false;
+}
+
+// ✅ CHANGE 3: NEW FUNCTION - Detects Audio Messages
+function isAudioFile(msg) {
+  // Check for standard audio message
+  if (msg.message?.audioMessage) return true;
+
+  // Check for audio files sent as documents
+  const doc = msg.message?.documentMessage;
+  if (doc) {
+    const mime = doc.mimetype || "";
+    // Common audio MIME types
+    return mime.startsWith('audio/') ||
+           mime === 'audio/mpeg' || // mp3
+           mime === 'audio/mp4' ||
+           mime === 'audio/wav' ||
+           mime === 'audio/x-wav' ||
+           mime === 'audio/ogg' ||
+           mime === 'audio/webm';
+  }
   return false;
 }
 
@@ -296,8 +259,7 @@ function cleanupCaches() {
 
 async function startBot() {
   try {
-    // ✅ LOAD AUTH STATE CORRECTLY
-    // This replaces the problematic 'useSingleFileAuthState'
+    // ✅ Uses the standard, reliable auth method. Files are saved to 'auth_info' folder.
     const { state, saveCreds } = await useMultiFileAuthState("auth_info");
     const keyStore = makeCacheableSignalKeyStore(state.keys, createSilentLogger());
 
@@ -323,10 +285,9 @@ async function startBot() {
       console.log("");
       console.log("📱 Requesting pairing code for: " + ADMIN_NUMBER);
       console.log("⏳ Please wait...");
-      
-      // Small delay to let connection establish
+
       await new Promise(r => setTimeout(r, 3000));
-      
+
       try {
         const code = await sock.requestPairingCode(ADMIN_NUMBER);
         console.log("");
@@ -348,31 +309,9 @@ async function startBot() {
         console.log("⚠️ Pairing code error:", e?.message);
         console.log("🔄 Will retry in 10 seconds...");
       }
-    } else {
-      // Save the current session to environment variable
-      const sessionData = {
-        creds: state.creds,
-        keys: state.keys
-      };
-      saveSessionToEnv(sessionData);
-    }
+    } // ✅ CHANGE 4: REMOVED the 'else' block that tried to call the broken saveSessionToEnv.
 
-    sock.ev.on("creds.update", async (creds) => {
-      // Update the state with new credentials
-      state.creds = creds;
-      
-      // Save credentials using original function
-      if (typeof saveCreds === 'function') {
-        await saveCreds();
-      }
-      
-      // Also save to environment variable
-      const sessionData = {
-        creds: state.creds,
-        keys: state.keys
-      };
-      saveSessionToEnv(sessionData);
-    });
+    sock.ev.on("creds.update", saveCreds); // ✅ The library handles saving automatically.
 
     sock.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
@@ -380,36 +319,35 @@ async function startBot() {
       if (connection === "open") {
         hasConnectedBefore = true;
         console.log("");
+        // ✅ CHANGE 5: Updated the online banner to remove the misleading "Saved in ENV" line.
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║ ✅ ANTI-LINK BOT v2.8 ONLINE            ║");
+        console.log("║ ✅ ANTI-LINK BOT v2.9 ONLINE            ║");
         console.log("╠══════════════════════════════════════════╣");
         console.log("║ 🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
         console.log("║ 👑 Owner: " + ADMIN_NUMBER.padEnd(30) + "║");
         console.log("║ 📋 Mode: All groups (try & catch)        ║");
         console.log("║ ⏱️ Not-admin cache: 1 hour               ║");
-        console.log("║ 💾 Session: Saved in ENV variable       ║");
+        console.log("║ 🎵 Violations: +AUDIO FILES             ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
         console.log("✅ Bot will process ALL groups.");
         console.log("✅ Messages deleted for EVERYONE (not just sender).");
         console.log("✅ Owner can use !bot command.");
         console.log("✅ ZIP files are now violations.");
-        console.log("✅ Session persists through restarts.");
+        console.log("✅ AUDIO files are now violations.");
         console.log("");
       }
 
       if (connection === "close") {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const reason = lastDisconnect?.error?.message || "unknown";
-        
+
         console.log("🔌 Connection closed: " + reason);
-        
+
         const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-        
+
         if (isLoggedOut && hasConnectedBefore) {
-          console.log("❌ Logged out. You'll need to re-pair.");
-          // Clear the saved session
-          console.log("🔄 Clear the WHATSAPP_SESSION environment variable and restart.");
+          console.log("❌ Logged out. Delete 'auth_info' folder and restart.");
         } else {
           const delay = hasConnectedBefore ? 5000 : 10000;
           console.log("🔄 Reconnecting in " + (delay/1000) + " seconds...");
@@ -488,7 +426,7 @@ async function startBot() {
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
             responseText += "📋 Mode: All groups (try & catch, Baby!)\n";
             responseText += "⏱️ Not-admin cache: 1 hour\n";
-            responseText += "💾 Session: Persists through restarts\n";
+            responseText += "🎵 New Violation: Audio Files\n";
             if (isOwner(senderJid)) {
               responseText += "🔑 You are the owner - you are exempt from all rules";
             }
@@ -500,10 +438,8 @@ async function startBot() {
           return;
         }
 
-        // Skip messages from bot itself (except !bot which was handled above)
         if (msg.key.fromMe) return;
 
-        // Owner is exempt from violations
         if (isOwner(senderJid)) {
           if (DEBUG_MODE) console.log("👑 Owner message - exempt from rules");
           return;
@@ -515,11 +451,14 @@ async function startBot() {
         const business = isBusinessPost(msg);
         const apk = isAPKFile(msg);
         const zip = isZipFile(msg);
+        // ✅ CHANGE 6: Added the new audio check here.
+        const audio = isAudioFile(msg);
         const keyword = detectKeyword(visibleText);
         const buttons = hasButtons(msg);
         const contact = isContactMessage(msg);
 
-        const violated = dup.isDuplicate || hasLink || hasPhone || business || apk || zip || keyword || buttons || contact;
+        // ✅ CHANGE 7: Added 'audio' to the violated condition.
+        const violated = dup.isDuplicate || hasLink || hasPhone || business || apk || zip || audio || keyword || buttons || contact;
         if (!violated) return;
 
         const reasons = [];
@@ -529,6 +468,7 @@ async function startBot() {
         if (business) reasons.push("business");
         if (apk) reasons.push("apk");
         if (zip) reasons.push("zip");
+        if (audio) reasons.push("audio"); // ✅ CHANGE 8: Added reason.
         if (keyword) reasons.push("keyword");
         if (buttons) reasons.push("buttons");
         if (contact) reasons.push("contact");
@@ -599,7 +539,7 @@ async function startBot() {
 const http = require('http');
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('🤖 Anti-Link Bot v2.8 ONLINE\nOwner: 254106090661\nSession: Persists through restarts');
+  res.end('🤖 Anti-Link Bot v2.9 ONLINE\nOwner: 254106090661\nViolations: +AUDIO');
 });
 
 const PORT = process.env.PORT || 3000;
