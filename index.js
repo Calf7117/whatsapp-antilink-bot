@@ -1,4 +1,4 @@
-// Anti-Link Bot - Simple Logic + Session Persistence
+// Anti-Link Bot v2.9.2 - Owner Exempt Fix + Session Persistence
 
 const {
   default: makeWASocket,
@@ -156,6 +156,15 @@ function extractPhoneNumber(jid) {
   let clean = String(jid).split("@")[0];
   clean = clean.split(":")[0];
   return clean.replace(/\D/g, "");
+}
+
+// Check if sender is the owner
+function isOwner(senderJid) {
+  if (!senderJid) return false;
+  const phone = extractPhoneNumber(senderJid);
+  if (phone === ADMIN_NUMBER) return true;
+  if (String(senderJid).includes(ADMIN_NUMBER)) return true;
+  return false;
 }
 
 function detectLinks(text) {
@@ -513,11 +522,6 @@ async function startBot() {
       }
     }
 
-    // ========== SIMPLE LOGIC AS YOU DESCRIBED ==========
-    // Message received → Is it from me?
-    //   YES → Is it !bot? Reply if yes, otherwise leave it alone
-    //   NO → Check for violations
-    
     async function handleMessage(msg) {
       try {
         // Only process group messages
@@ -529,31 +533,7 @@ async function startBot() {
         const visibleText = extractVisibleText(msg).trim();
         const textLower = visibleText.toLowerCase();
 
-        // ===== STEP 1: Is this message from ME? =====
-        if (msg.key.fromMe) {
-          console.log("👑 Message from owner (fromMe: true)");
-          
-          // Check if it's !bot command
-          if (textLower === "!bot") {
-            console.log("📨 Owner sent !bot command");
-            try {
-              let responseText = "✅ ANTI-LINK BOT ACTIVE\n";
-              responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
-              responseText += "📋 Mode: All groups\n";
-              responseText += "💃 We R 🆗 Baby!! 🤫\n";
-              responseText += "🔑 You are the owner - exempt from all rules";
-              await sock.sendMessage(groupJid, { text: responseText });
-            } catch (e) {
-              console.log("⚠️ Could not send !bot reply:", e?.message);
-            }
-          }
-          // Whether it's !bot or anything else, owner is exempt - STOP HERE
-          return;
-        }
-
-        // ===== STEP 2: Message is NOT from me, check for violations =====
-        
-        // !bot command from others
+        // ===== CHECK !bot COMMAND FIRST (before any exemption) =====
         if (textLower === "!bot") {
           console.log("📨 !bot command from:", senderJid);
           try {
@@ -561,14 +541,31 @@ async function startBot() {
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
             responseText += "📋 Mode: All groups\n";
             responseText += "💃 We R 🆗 Baby!! 🤫";
+            if (msg.key.fromMe || isOwner(senderJid)) {
+              responseText += "\n🔑 You are the owner - exempt from all rules";
+            }
             await sock.sendMessage(groupJid, { text: responseText });
+            console.log("✅ Sent !bot response");
           } catch (e) {
             console.log("⚠️ Could not send !bot reply:", e?.message);
           }
           return;
         }
 
-        // Check all violations
+        // ===== OWNER EXEMPTION: Check BOTH fromMe AND isOwner =====
+        // If message is from bot itself (linked to your account)
+        if (msg.key.fromMe) {
+          if (DEBUG_MODE) console.log("👑 Owner message (fromMe) - exempt");
+          return;
+        }
+        
+        // If sender JID matches owner number (backup check for apps)
+        if (isOwner(senderJid)) {
+          if (DEBUG_MODE) console.log("👑 Owner message (isOwner) - exempt");
+          return;
+        }
+
+        // ===== NOT OWNER - CHECK FOR VIOLATIONS =====
         const dup = checkDuplicate(groupJid, senderJid, visibleText);
         const hasLink = detectLinks(visibleText);
         const hasPhone = detectPhoneNumbers(visibleText);
@@ -603,8 +600,10 @@ async function startBot() {
         console.log("");
         console.log("🚫 VIOLATION DETECTED");
         console.log("User: " + senderJid);
+        console.log("Group: " + groupJid);
         console.log("Reason: " + reasons.join(", "));
         console.log("Strike: " + updated + "/3");
+        console.log("Text: " + visibleText.substring(0, 100));
 
         const deleted = await safeDelete(groupJid, msg.key);
         if (deleted) {
@@ -619,6 +618,7 @@ async function startBot() {
             }
           }
         }
+        console.log("");
       } catch (e) {
         console.log("⚠️ Error:", e?.message);
       }
