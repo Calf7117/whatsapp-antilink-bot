@@ -1,5 +1,5 @@
-// index.js - Anti-Link Bot v2.7
-// Your v2.8 with 3 fixes: encryption key, audio detection, session restore on startup
+// index.js - Anti-Link Bot v2.9.1
+// Fixed: Owner exempt from all rules + audio detection + session persistence
 
 const {
   default: makeWASocket,
@@ -22,7 +22,7 @@ const AUTH_FOLDER = "./auth_info";
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Anti-Link Bot v2.9 Running");
+  res.end("Anti-Link Bot v2.9.1 Running");
 }).listen(PORT, () => console.log("Health server on port " + PORT));
 
 const userViolations = new Map();
@@ -44,7 +44,7 @@ const createSilentLogger = () => {
   };
 };
 
-// ===== FIX 1: Encryption key now exactly 32 bytes =====
+// Encryption key - exactly 32 bytes
 function getEncryptionKey() {
   const key = process.env.SESSION_KEY || "AntiLinkBotDefaultKey2024SecureX";
   return crypto.createHash("sha256").update(key).digest();
@@ -78,7 +78,7 @@ function decrypt(text) {
   }
 }
 
-// ===== FIX 3: This function now gets CALLED on startup =====
+// Restore session from environment variable
 function restoreSessionFromEnv() {
   try {
     const encrypted = process.env.WHATSAPP_SESSION;
@@ -159,11 +159,34 @@ function extractPhoneNumber(jid) {
   return clean.replace(/\D/g, "");
 }
 
+// FIXED: Owner check now works properly with all JID formats
 function isOwner(senderJid) {
   if (!senderJid) return false;
+  const jidString = String(senderJid);
+  
+  // Method 1: Direct include check (handles 254106090661:42@s.whatsapp.net)
+  if (jidString.includes(ADMIN_NUMBER)) {
+    console.log("👑 Owner detected (include match): " + jidString.substring(0, 30));
+    return true;
+  }
+  
+  // Method 2: Extract and compare phone number
   const phone = extractPhoneNumber(senderJid);
-  if (phone === ADMIN_NUMBER) return true;
-  if (String(senderJid).includes(ADMIN_NUMBER)) return true;
+  if (phone === ADMIN_NUMBER) {
+    console.log("👑 Owner detected (exact match): " + phone);
+    return true;
+  }
+  
+  // Method 3: Check if phone ends with admin number (country code variations)
+  if (phone.endsWith(ADMIN_NUMBER)) {
+    console.log("👑 Owner detected (ends with): " + phone);
+    return true;
+  }
+  if (ADMIN_NUMBER.endsWith(phone) && phone.length >= 9) {
+    console.log("👑 Owner detected (admin ends with phone): " + phone);
+    return true;
+  }
+  
   return false;
 }
 
@@ -196,7 +219,7 @@ function isZipFile(msg) {
   return false;
 }
 
-// ===== FIX 2: Audio file detection =====
+// Audio file detection (not voice calls or video)
 function isAudioFile(msg) {
   const m = msg.message || {};
   
@@ -378,7 +401,7 @@ function cleanupCaches() {
 
 async function startBot() {
   try {
-    // ===== FIX 3: Restore session BEFORE loading auth state =====
+    // Restore session from environment variable FIRST
     restoreSessionFromEnv();
     
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
@@ -443,13 +466,12 @@ async function startBot() {
         hasConnectedBefore = true;
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║ ✅ ANTI-LINK BOT v2.7 ONLINE             ║");
+        console.log("║ ✅ ANTI-LINK BOT v2.9.1 ONLINE           ║");
         console.log("╠══════════════════════════════════════════╣");
         console.log("║ 🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
         console.log("║ 👑 Owner: " + ADMIN_NUMBER.padEnd(30) + "║");
-        console.log("║ 📋 Mode: All groups (try & catch)        ║");
-        console.log("║ ⏱️ Not-admin cache: 1 hour               ║");
-        console.log("║ 🎵 Audio files: BLOCKED                  ║");
+        console.log("║ 📋 Mode: All groups                      ║");
+        console.log("║ 💃 We R 🆗 Baby!! 🤫                     ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
         saveSessionToEnv();
@@ -538,12 +560,12 @@ async function startBot() {
         if (textLower === "!bot") {
           console.log("📨 !bot command from:", senderJid);
           try {
-            let responseText = "✅ ANTI-LINK BOT v2.7 ACTIVE\n";
+            let responseText = "✅ ANTI-LINK BOT ACTIVE\n";
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
             responseText += "📋 Mode: All groups\n";
             responseText += "💃 We R 🆗 Baby!! 🤫\n";
             if (isOwner(senderJid)) {
-              responseText += "🔑 You are the owner - exempt from rules";
+              responseText += "🔑 You are the owner - exempt from all rules";
             }
             await sock.sendMessage(groupJid, { text: responseText });
           } catch (e) {
@@ -552,10 +574,12 @@ async function startBot() {
           return;
         }
 
+        // Skip bot's own messages
         if (msg.key.fromMe) return;
+        
+        // OWNER IS EXEMPT FROM ALL RULES
         if (isOwner(senderJid)) {
-          if (DEBUG_MODE) console.log("👑 Owner message - exempt");
-          return;
+          return; // Owner can send anything!
         }
 
         const dup = checkDuplicate(groupJid, senderJid, visibleText);
