@@ -1,9 +1,5 @@
-// index.js - Anti-Link Bot v3.1 (FIXED PAIRING)
-// ✅ FIXED: Pairing code "check number" error
-// ✅ FIXED: Session persistence (restores on restart)
-// ✅ FIXED: Encryption key length (32 bytes)
-// ✅ ADDED: Audio file detection
-// ✅ Works with Render Free Web Service
+// index.js - Anti-Link Bot v2.7
+// Your v2.8 with 3 fixes: encryption key, audio detection, session restore on startup
 
 const {
   default: makeWASocket,
@@ -16,11 +12,18 @@ const {
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
 
-// ✅ SET YOUR NUMBER HERE OR USE ENV VARIABLE
-const ADMIN_NUMBER = process.env.ADMIN_NUMBER || "254106090661";
+const ADMIN_NUMBER = "254106090661";
 const DEBUG_MODE = true;
 const AUTH_FOLDER = "./auth_info";
+
+// Health check server for Render
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Anti-Link Bot v2.9 Running");
+}).listen(PORT, () => console.log("Health server on port " + PORT));
 
 const userViolations = new Map();
 const notAdminGroups = new Map();
@@ -41,20 +44,19 @@ const createSilentLogger = () => {
   };
 };
 
-// ✅ FIX 1: Get encryption key - MUST be exactly 32 bytes for AES-256-CBC
+// ===== FIX 1: Encryption key now exactly 32 bytes =====
 function getEncryptionKey() {
-  const key = process.env.SESSION_KEY || 'AntiLinkBotSecretKey2024!';
-  return crypto.createHash('sha256').update(key).digest();
+  const key = process.env.SESSION_KEY || "AntiLinkBotDefaultKey2024SecureX";
+  return crypto.createHash("sha256").update(key).digest();
 }
 
 function encrypt(text) {
   try {
     const iv = crypto.randomBytes(16);
-    const key = getEncryptionKey();
-    const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
-    let encrypted = cipher.update(text, 'utf8', 'hex');
-    encrypted += cipher.final('hex');
-    return iv.toString('hex') + ':' + encrypted;
+    const cipher = crypto.createCipheriv("aes-256-cbc", getEncryptionKey(), iv);
+    let encrypted = cipher.update(text, "utf8", "hex");
+    encrypted += cipher.final("hex");
+    return iv.toString("hex") + ":" + encrypted;
   } catch (error) {
     console.log("❌ Encryption error:", error.message);
     return null;
@@ -63,13 +65,12 @@ function encrypt(text) {
 
 function decrypt(text) {
   try {
-    const parts = text.split(':');
-    const iv = Buffer.from(parts.shift(), 'hex');
-    const encryptedText = parts.join(':');
-    const key = getEncryptionKey();
-    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-    let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
+    const parts = text.split(":");
+    const iv = Buffer.from(parts.shift(), "hex");
+    const encryptedText = parts.join(":");
+    const decipher = crypto.createDecipheriv("aes-256-cbc", getEncryptionKey(), iv);
+    let decrypted = decipher.update(encryptedText, "hex", "utf8");
+    decrypted += decipher.final("utf8");
     return decrypted;
   } catch (error) {
     console.log("❌ Decryption error:", error.message);
@@ -77,37 +78,33 @@ function decrypt(text) {
   }
 }
 
-// ✅ FIX 2: RESTORE session from env var - THIS WAS MISSING IN v2.8!
+// ===== FIX 3: This function now gets CALLED on startup =====
 function restoreSessionFromEnv() {
   try {
     const encrypted = process.env.WHATSAPP_SESSION;
     if (!encrypted) {
-      console.log("ℹ️ No saved session in WHATSAPP_SESSION env var");
+      console.log("ℹ️ No saved session found in environment variables");
       return false;
     }
-
-    console.log("📂 Found saved session, restoring...");
     
+    console.log("🔄 Restoring session from environment variable...");
     const decrypted = decrypt(encrypted);
     if (!decrypted) {
       console.log("❌ Failed to decrypt session");
       return false;
     }
-
-    const sessionFiles = JSON.parse(decrypted);
     
+    const sessionData = JSON.parse(decrypted);
     if (!fs.existsSync(AUTH_FOLDER)) {
       fs.mkdirSync(AUTH_FOLDER, { recursive: true });
     }
-
-    let fileCount = 0;
-    for (const [filename, content] of Object.entries(sessionFiles)) {
+    
+    for (const [filename, content] of Object.entries(sessionData)) {
       const filePath = path.join(AUTH_FOLDER, filename);
       fs.writeFileSync(filePath, JSON.stringify(content, null, 2));
-      fileCount++;
     }
-
-    console.log("✅ Restored " + fileCount + " session files from env var");
+    
+    console.log("✅ Session restored successfully!");
     return true;
   } catch (error) {
     console.log("❌ Error restoring session:", error.message);
@@ -117,57 +114,41 @@ function restoreSessionFromEnv() {
 
 function saveSessionToEnv() {
   try {
-    if (!fs.existsSync(AUTH_FOLDER)) {
-      console.log("⚠️ No auth folder exists yet");
-      return null;
-    }
-
+    if (!fs.existsSync(AUTH_FOLDER)) return;
+    
     const files = fs.readdirSync(AUTH_FOLDER);
-    const sessionFiles = {};
-
+    const sessionData = {};
+    
     for (const file of files) {
-      if (file.endsWith('.json')) {
-        const filePath = path.join(AUTH_FOLDER, file);
+      if (file.endsWith(".json")) {
         try {
-          const content = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-          sessionFiles[file] = content;
+          const content = fs.readFileSync(path.join(AUTH_FOLDER, file), "utf8");
+          sessionData[file] = JSON.parse(content);
         } catch (e) {}
       }
     }
-
-    if (Object.keys(sessionFiles).length === 0) {
-      console.log("⚠️ No session files to save");
-      return null;
-    }
-
-    const sessionString = JSON.stringify(sessionFiles);
-    const encrypted = encrypt(sessionString);
-
-    if (!encrypted) {
-      console.log("❌ Failed to encrypt session");
-      return null;
-    }
-
-    console.log("\n" + "=".repeat(70));
-    console.log("📁 SAVE THIS TO RENDER ENVIRONMENT VARIABLE:");
-    console.log("=".repeat(70));
-    console.log("Variable Name: WHATSAPP_SESSION");
-    console.log("Variable Value (copy everything below between the lines):");
-    console.log("-".repeat(70));
+    
+    if (Object.keys(sessionData).length === 0) return;
+    
+    const encrypted = encrypt(JSON.stringify(sessionData));
+    if (!encrypted) return;
+    
+    console.log("");
+    console.log("=".repeat(60));
+    console.log("📁 COPY THIS SESSION DATA TO RENDER ENVIRONMENT VARIABLE:");
+    console.log("=".repeat(60));
+    console.log("VARIABLE NAME: WHATSAPP_SESSION");
+    console.log("VARIABLE VALUE:");
     console.log(encrypted);
-    console.log("-".repeat(70));
-    console.log("\n📋 STEPS:");
-    console.log("1. Copy the value above (the long encrypted string)");
-    console.log("2. Go to Render Dashboard → Your Service → Environment");
-    console.log("3. Add/Update: WHATSAPP_SESSION = (paste the value)");
-    console.log("4. Click 'Save Changes'");
-    console.log("5. Bot will auto-reconnect on next restart!");
-    console.log("=".repeat(70) + "\n");
-
-    return encrypted;
+    console.log("=".repeat(60));
+    console.log("1. Go to Render Dashboard → Your Service → Environment");
+    console.log("2. Add Environment Variable: WHATSAPP_SESSION");
+    console.log("3. Paste the value above");
+    console.log("4. Redeploy (optional)");
+    console.log("=".repeat(60));
+    console.log("");
   } catch (error) {
     console.log("❌ Error saving session:", error.message);
-    return null;
   }
 }
 
@@ -215,17 +196,18 @@ function isZipFile(msg) {
   return false;
 }
 
-// ✅ FIX 3: Audio file detection (voice notes & audio documents, NOT video/calls)
+// ===== FIX 2: Audio file detection =====
 function isAudioFile(msg) {
   const m = msg.message || {};
   
+  // Direct audio message (voice notes, audio files)
   if (m.audioMessage) return true;
   
-  const vo = m.viewOnceMessage?.message || 
-             m.viewOnceMessageV2?.message || 
-             m.viewOnceMessageV2Extension?.message;
+  // View-once audio
+  const vo = m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m.viewOnceMessageV2Extension?.message;
   if (vo?.audioMessage) return true;
   
+  // Audio sent as document
   const doc = m.documentMessage;
   if (doc) {
     const mimetype = (doc.mimetype || "").toLowerCase();
@@ -334,8 +316,8 @@ function extractTextFromContent(content) {
   if (quoted && typeof quoted === "object") push(extractTextFromContent(quoted));
 
   const vo = content.viewOnceMessage?.message ||
-    content.viewOnceMessageV2?.message ||
-    content.viewOnceMessageV2Extension?.message;
+             content.viewOnceMessageV2?.message ||
+             content.viewOnceMessageV2Extension?.message;
   if (vo) push(extractTextFromContent(vo));
 
   return texts.join(" ").trim();
@@ -396,9 +378,9 @@ function cleanupCaches() {
 
 async function startBot() {
   try {
-    // ✅ CRITICAL: Restore session from env var BEFORE loading auth state!
+    // ===== FIX 3: Restore session BEFORE loading auth state =====
     restoreSessionFromEnv();
-
+    
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
     const keyStore = makeCacheableSignalKeyStore(state.keys, createSilentLogger());
 
@@ -419,62 +401,39 @@ async function startBot() {
       msgRetryCounterCache: new Map(),
     });
 
+    // Request pairing code if not registered
     if (!state.creds.registered) {
       console.log("");
-      console.log("📱 New device - requesting pairing code for: " + ADMIN_NUMBER);
-      console.log("⏳ Please wait 5 seconds before requesting code...");
-
-      // ✅ LONGER DELAY - helps avoid "check number" error
-      await new Promise(r => setTimeout(r, 5000));
-
-      // ✅ RETRY LOGIC for pairing code
-      let code = null;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          console.log("📱 Requesting pairing code (attempt " + attempt + "/3)...");
-          code = await sock.requestPairingCode(ADMIN_NUMBER);
-          break; // Success!
-        } catch (e) {
-          console.log("⚠️ Attempt " + attempt + " failed:", e?.message);
-          if (attempt < 3) {
-            console.log("⏳ Waiting 10 seconds before retry...");
-            await new Promise(r => setTimeout(r, 10000));
-          }
-        }
-      }
-
-      if (code) {
+      console.log("📱 Requesting pairing code for: " + ADMIN_NUMBER);
+      console.log("⏳ Please wait...");
+      
+      await new Promise(r => setTimeout(r, 3000));
+      
+      try {
+        const code = await sock.requestPairingCode(ADMIN_NUMBER);
         console.log("");
         console.log("╔════════════════════════════════════════╗");
         console.log("║ 📱 PAIRING CODE (Valid for 60 seconds) ║");
         console.log("╠════════════════════════════════════════╣");
         console.log("║                                        ║");
-        console.log("║           " + code + "                   ║");
+        console.log("║     " + code + "                         ║");
         console.log("║                                        ║");
         console.log("╠════════════════════════════════════════╣");
-        console.log("║ 1. Open WhatsApp → Settings            ║");
-        console.log("║ 2. Tap 'Linked Devices'                ║");
+        console.log("║ 1. Open WhatsApp on your phone         ║");
+        console.log("║ 2. Go to: Settings → Linked Devices    ║");
         console.log("║ 3. Tap 'Link a Device'                 ║");
         console.log("║ 4. Enter the 8-digit code above        ║");
         console.log("╚════════════════════════════════════════╝");
         console.log("");
-      } else {
-        console.log("");
-        console.log("❌ COULD NOT GET PAIRING CODE!");
-        console.log("📋 TROUBLESHOOTING:");
-        console.log("   1. Unlink ALL devices in WhatsApp → Linked Devices");
-        console.log("   2. Wait 5-10 minutes");
-        console.log("   3. Make sure ADMIN_NUMBER is correct: " + ADMIN_NUMBER);
-        console.log("   4. Restart the bot");
-        console.log("");
+      } catch (e) {
+        console.log("⚠️ Pairing code error:", e?.message);
+        console.log("🔄 Will retry in 10 seconds...");
       }
-    } else {
-      console.log("✅ Found existing session, connecting...");
     }
 
     sock.ev.on("creds.update", async () => {
       await saveCreds();
-      setTimeout(() => saveSessionToEnv(), 2000);
+      saveSessionToEnv();
     });
 
     sock.ev.on("connection.update", async (update) => {
@@ -484,42 +443,29 @@ async function startBot() {
         hasConnectedBefore = true;
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║ ✅ ANTI-LINK BOT v3.1 ONLINE             ║");
+        console.log("║ ✅ ANTI-LINK BOT v2.7 ONLINE             ║");
         console.log("╠══════════════════════════════════════════╣");
-        console.log("║ 🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(32) + "║");
+        console.log("║ 🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
         console.log("║ 👑 Owner: " + ADMIN_NUMBER.padEnd(30) + "║");
-        console.log("║ 📋 Mode: All groups                      ║");
-        console.log("║ 💾 Session: ENV variable                 ║");
+        console.log("║ 📋 Mode: All groups (try & catch)        ║");
+        console.log("║ ⏱️ Not-admin cache: 1 hour               ║");
         console.log("║ 🎵 Audio files: BLOCKED                  ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
-
-        // ✅ Save session immediately AND after 5 seconds
-        console.log("💾 Saving session for future restarts...");
         saveSessionToEnv();
-        setTimeout(() => {
-          console.log("💾 Saving session again (backup)...");
-          saveSessionToEnv();
-        }, 5000);
       }
 
       if (connection === "close") {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const reason = lastDisconnect?.error?.message || "unknown";
-
-        console.log("🔌 Connection closed: " + reason + " (code: " + statusCode + ")");
-
-        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
-
-        if (isLoggedOut) {
-          console.log("❌ Logged out! Clearing session...");
+        
+        console.log("🔌 Connection closed: " + reason);
+        
+        if (statusCode === DisconnectReason.loggedOut) {
+          console.log("❌ Logged out. Delete WHATSAPP_SESSION env var and redeploy.");
           if (fs.existsSync(AUTH_FOLDER)) {
             fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-            console.log("🗑️ Cleared local auth files");
           }
-          console.log("⚠️ Delete WHATSAPP_SESSION env var in Render and redeploy!");
-          console.log("⚠️ Also unlink the device in WhatsApp → Linked Devices");
-          process.exit(1); // Stop bot - needs manual intervention
         } else {
           const delay = hasConnectedBefore ? 5000 : 10000;
           console.log("🔄 Reconnecting in " + (delay/1000) + " seconds...");
@@ -528,14 +474,14 @@ async function startBot() {
       }
 
       if (qr) {
-        console.log("📱 QR received - using pairing code instead");
+        console.log("📱 QR Code received - but we're using pairing code instead");
       }
     });
 
     async function safeDelete(groupJid, msgKey) {
       const notAdmin = notAdminGroups.get(groupJid);
       if (notAdmin && (Date.now() - notAdmin) < NOT_ADMIN_CACHE_TTL) {
-        if (DEBUG_MODE) console.log("⏭️ Skip - not admin (cached)");
+        if (DEBUG_MODE) console.log("⏭️ Skipping - cached as not admin");
         return false;
       }
 
@@ -549,7 +495,6 @@ async function startBot() {
           return true;
         } catch (e) {
           const errMsg = String(e?.message || e || "");
-          console.log("⚠️ Delete error (attempt " + attempt + "):", errMsg);
 
           if (errMsg.includes("rate-overlimit")) {
             delay = 2000 * attempt;
@@ -558,7 +503,7 @@ async function startBot() {
 
           if (errMsg.includes("forbidden") || errMsg.includes("not-authorized") || errMsg.includes("403")) {
             notAdminGroups.set(groupJid, Date.now());
-            console.log("📝 Not admin - cached for 1 hour");
+            console.log("📝 Not admin in this group - caching for 1 hour");
           }
 
           break;
@@ -570,10 +515,10 @@ async function startBot() {
     async function safeRemove(groupJid, userJid) {
       try {
         await sock.groupParticipantsUpdate(groupJid, [userJid], "remove");
-        console.log("✅ User removed");
+        console.log("✅ User removed from group");
         return true;
       } catch (e) {
-        console.log("⚠️ Remove failed:", e?.message);
+        console.log("⚠️ Could not remove user:", e?.message);
         return false;
       }
     }
@@ -585,24 +530,33 @@ async function startBot() {
 
         const groupJid = msg.key.remoteJid;
         const senderJid = msg.key.participant || msg.key.remoteJid;
+
         const visibleText = extractVisibleText(msg).trim();
         const textLower = visibleText.toLowerCase();
 
+        // !bot command
         if (textLower === "!bot") {
-          console.log("📨 !bot from:", senderJid);
+          console.log("📨 !bot command from:", senderJid);
           try {
-            let resp = "✅ ANTI-LINK BOT v3.0 ACTIVE\n";
-            resp += "👑 Owner: " + ADMIN_NUMBER + "\n";
-            resp += "📋 Mode: All groups\n";
-            resp += "💃 We R 🆗 Baby!! 🤫\n";
-            if (isOwner(senderJid)) resp += "🔑 You are the owner";
-            await sock.sendMessage(groupJid, { text: resp });
-          } catch (e) {}
+            let responseText = "✅ ANTI-LINK BOT v2.7 ACTIVE\n";
+            responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
+            responseText += "📋 Mode: All groups\n";
+            responseText += "💃 We R 🆗 Baby!! 🤫\n";
+            if (isOwner(senderJid)) {
+              responseText += "🔑 You are the owner - exempt from rules";
+            }
+            await sock.sendMessage(groupJid, { text: responseText });
+          } catch (e) {
+            console.log("⚠️ Could not send !bot reply:", e?.message);
+          }
           return;
         }
 
         if (msg.key.fromMe) return;
-        if (isOwner(senderJid)) return;
+        if (isOwner(senderJid)) {
+          if (DEBUG_MODE) console.log("👑 Owner message - exempt");
+          return;
+        }
 
         const dup = checkDuplicate(groupJid, senderJid, visibleText);
         const hasLink = detectLinks(visibleText);
@@ -636,27 +590,32 @@ async function startBot() {
         userViolations.set(userKey, updated);
 
         console.log("");
-        console.log("🚫 VIOLATION: " + reasons.join(", "));
-        console.log("👤 User: " + senderJid.substring(0, 20));
-        console.log("📊 Strike: " + updated + "/3");
+        console.log("🚫 VIOLATION DETECTED");
+        console.log("User: " + senderJid);
+        console.log("Reason: " + reasons.join(", "));
+        console.log("Strike: " + updated + "/3");
 
         const deleted = await safeDelete(groupJid, msg.key);
         if (deleted) {
-          console.log("✅ Deleted");
+          console.log("✅ Message deleted");
+
           if (updated >= 3) {
+            console.log("⚠️ 3 strikes - removing user...");
             await new Promise(r => setTimeout(r, 500));
             const removed = await safeRemove(groupJid, senderJid);
-            if (removed) userViolations.delete(userKey);
+            if (removed) {
+              userViolations.delete(userKey);
+            }
           }
         }
-        console.log("");
       } catch (e) {
-        console.log("⚠️ Handle error:", e?.message);
+        console.log("⚠️ Error:", e?.message);
       }
     }
 
     sock.ev.on("messages.upsert", async (m) => {
-      for (const msg of (m.messages || [])) {
+      const messages = m.messages || [];
+      for (const msg of messages) {
         if (!msg?.key?.remoteJid?.endsWith("@g.us")) continue;
         if (!msg.message) continue;
         handleMessage(msg).catch(() => {});
@@ -664,23 +623,13 @@ async function startBot() {
     });
 
     setInterval(cleanupCaches, 30000);
-    console.log("🚀 Bot initialized...");
+    console.log("🚀 Bot initialized - waiting for connection...");
 
   } catch (e) {
     console.log("❌ Start error:", e.message);
+    console.log("🔄 Retrying in 30 seconds...");
     setTimeout(() => startBot().catch(() => {}), 30000);
   }
 }
-
-// Simple HTTP server for Render health checks
-const http = require("http");
-const PORT = process.env.PORT || 3000;
-
-http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Anti-Link Bot v3.1 Running");
-}).listen(PORT, () => {
-  console.log("🌐 Health check server on port " + PORT);
-});
 
 startBot();
