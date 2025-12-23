@@ -1,4 +1,4 @@
-// Anti-Link Bot - Owner Exempt + Audio Detection + Session Persistence
+// Anti-Link Bot - Simple Logic + Session Persistence
 
 const {
   default: makeWASocket,
@@ -77,7 +77,7 @@ function decrypt(text) {
   }
 }
 
-// Restore session from environment variable - CALLED AT STARTUP
+// Restore session from environment variable
 function restoreSessionFromEnv() {
   try {
     const encrypted = process.env.WHATSAPP_SESSION;
@@ -156,30 +156,6 @@ function extractPhoneNumber(jid) {
   let clean = String(jid).split("@")[0];
   clean = clean.split(":")[0];
   return clean.replace(/\D/g, "");
-}
-
-// Owner check - multiple methods to ensure it works
-function isOwner(senderJid) {
-  if (!senderJid) return false;
-  const jidString = String(senderJid);
-  
-  // Method 1: Direct include check
-  if (jidString.includes(ADMIN_NUMBER)) {
-    return true;
-  }
-  
-  // Method 2: Extract and compare phone number
-  const phone = extractPhoneNumber(senderJid);
-  if (phone === ADMIN_NUMBER) {
-    return true;
-  }
-  
-  // Method 3: Ends with check
-  if (phone.endsWith(ADMIN_NUMBER) || ADMIN_NUMBER.endsWith(phone)) {
-    if (phone.length >= 9) return true;
-  }
-  
-  return false;
 }
 
 function detectLinks(text) {
@@ -393,7 +369,7 @@ function cleanupCaches() {
 
 async function startBot() {
   try {
-    // RESTORE SESSION FIRST - This is what makes "pair once, connect forever" work
+    // RESTORE SESSION FIRST
     restoreSessionFromEnv();
     
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
@@ -537,19 +513,29 @@ async function startBot() {
       }
     }
 
+    // ========== SIMPLE LOGIC AS YOU DESCRIBED ==========
+    // Message received → Is it from me?
+    //   YES → Is it !bot? Reply if yes, otherwise leave it alone
+    //   NO → Check for violations
+    
     async function handleMessage(msg) {
       try {
+        // Only process group messages
         if (!msg?.key?.remoteJid?.endsWith("@g.us")) return;
         if (!msg.message) return;
 
         const groupJid = msg.key.remoteJid;
         const senderJid = msg.key.participant || msg.key.remoteJid;
+        const visibleText = extractVisibleText(msg).trim();
+        const textLower = visibleText.toLowerCase();
 
-        // OWNER EXEMPT: If message is fromMe (sent by linked account = YOU), skip all checks
+        // ===== STEP 1: Is this message from ME? =====
         if (msg.key.fromMe) {
-          // But still respond to !bot command
-          const visibleText = extractVisibleText(msg).trim();
-          if (visibleText.toLowerCase() === "!bot") {
+          console.log("👑 Message from owner (fromMe: true)");
+          
+          // Check if it's !bot command
+          if (textLower === "!bot") {
+            console.log("📨 Owner sent !bot command");
             try {
               let responseText = "✅ ANTI-LINK BOT ACTIVE\n";
               responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
@@ -557,14 +543,16 @@ async function startBot() {
               responseText += "💃 We R 🆗 Baby!! 🤫\n";
               responseText += "🔑 You are the owner - exempt from all rules";
               await sock.sendMessage(groupJid, { text: responseText });
-            } catch (e) {}
+            } catch (e) {
+              console.log("⚠️ Could not send !bot reply:", e?.message);
+            }
           }
-          return; // Owner is exempt - don't check violations
+          // Whether it's !bot or anything else, owner is exempt - STOP HERE
+          return;
         }
 
-        const visibleText = extractVisibleText(msg).trim();
-        const textLower = visibleText.toLowerCase();
-
+        // ===== STEP 2: Message is NOT from me, check for violations =====
+        
         // !bot command from others
         if (textLower === "!bot") {
           console.log("📨 !bot command from:", senderJid);
@@ -580,11 +568,7 @@ async function startBot() {
           return;
         }
 
-        // Double-check owner by JID (for messages from other devices)
-        if (isOwner(senderJid)) {
-          return; // Owner exempt
-        }
-
+        // Check all violations
         const dup = checkDuplicate(groupJid, senderJid, visibleText);
         const hasLink = detectLinks(visibleText);
         const hasPhone = detectPhoneNumbers(visibleText);
