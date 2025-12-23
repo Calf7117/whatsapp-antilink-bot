@@ -1,5 +1,4 @@
-// index.js - Anti-Link Bot v2.9.1
-// Fixed: Owner exempt from all rules + audio detection + session persistence
+// Anti-Link Bot - Owner Exempt + Audio Detection + Session Persistence
 
 const {
   default: makeWASocket,
@@ -22,7 +21,7 @@ const AUTH_FOLDER = "./auth_info";
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Anti-Link Bot v2.9.1 Running");
+  res.end("Anti-Link Bot Running");
 }).listen(PORT, () => console.log("Health server on port " + PORT));
 
 const userViolations = new Map();
@@ -44,7 +43,7 @@ const createSilentLogger = () => {
   };
 };
 
-// Encryption key - exactly 32 bytes
+// Encryption key - exactly 32 bytes using SHA-256 hash
 function getEncryptionKey() {
   const key = process.env.SESSION_KEY || "AntiLinkBotDefaultKey2024SecureX";
   return crypto.createHash("sha256").update(key).digest();
@@ -58,7 +57,7 @@ function encrypt(text) {
     encrypted += cipher.final("hex");
     return iv.toString("hex") + ":" + encrypted;
   } catch (error) {
-    console.log("❌ Encryption error:", error.message);
+    console.log("Encryption error:", error.message);
     return null;
   }
 }
@@ -73,12 +72,12 @@ function decrypt(text) {
     decrypted += decipher.final("utf8");
     return decrypted;
   } catch (error) {
-    console.log("❌ Decryption error:", error.message);
+    console.log("Decryption error:", error.message);
     return null;
   }
 }
 
-// Restore session from environment variable
+// Restore session from environment variable - CALLED AT STARTUP
 function restoreSessionFromEnv() {
   try {
     const encrypted = process.env.WHATSAPP_SESSION;
@@ -159,32 +158,25 @@ function extractPhoneNumber(jid) {
   return clean.replace(/\D/g, "");
 }
 
-// FIXED: Owner check now works properly with all JID formats
+// Owner check - multiple methods to ensure it works
 function isOwner(senderJid) {
   if (!senderJid) return false;
   const jidString = String(senderJid);
   
-  // Method 1: Direct include check (handles 254106090661:42@s.whatsapp.net)
+  // Method 1: Direct include check
   if (jidString.includes(ADMIN_NUMBER)) {
-    console.log("👑 Owner detected (include match): " + jidString.substring(0, 30));
     return true;
   }
   
   // Method 2: Extract and compare phone number
   const phone = extractPhoneNumber(senderJid);
   if (phone === ADMIN_NUMBER) {
-    console.log("👑 Owner detected (exact match): " + phone);
     return true;
   }
   
-  // Method 3: Check if phone ends with admin number (country code variations)
-  if (phone.endsWith(ADMIN_NUMBER)) {
-    console.log("👑 Owner detected (ends with): " + phone);
-    return true;
-  }
-  if (ADMIN_NUMBER.endsWith(phone) && phone.length >= 9) {
-    console.log("👑 Owner detected (admin ends with phone): " + phone);
-    return true;
+  // Method 3: Ends with check
+  if (phone.endsWith(ADMIN_NUMBER) || ADMIN_NUMBER.endsWith(phone)) {
+    if (phone.length >= 9) return true;
   }
   
   return false;
@@ -401,7 +393,7 @@ function cleanupCaches() {
 
 async function startBot() {
   try {
-    // Restore session from environment variable FIRST
+    // RESTORE SESSION FIRST - This is what makes "pair once, connect forever" work
     restoreSessionFromEnv();
     
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
@@ -466,7 +458,7 @@ async function startBot() {
         hasConnectedBefore = true;
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║ ✅ ANTI-LINK BOT v2.9.1 ONLINE           ║");
+        console.log("║ ✅ ANTI-LINK BOT ONLINE                  ║");
         console.log("╠══════════════════════════════════════════╣");
         console.log("║ 🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
         console.log("║ 👑 Owner: " + ADMIN_NUMBER.padEnd(30) + "║");
@@ -553,20 +545,34 @@ async function startBot() {
         const groupJid = msg.key.remoteJid;
         const senderJid = msg.key.participant || msg.key.remoteJid;
 
+        // OWNER EXEMPT: If message is fromMe (sent by linked account = YOU), skip all checks
+        if (msg.key.fromMe) {
+          // But still respond to !bot command
+          const visibleText = extractVisibleText(msg).trim();
+          if (visibleText.toLowerCase() === "!bot") {
+            try {
+              let responseText = "✅ ANTI-LINK BOT ACTIVE\n";
+              responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
+              responseText += "📋 Mode: All groups\n";
+              responseText += "💃 We R 🆗 Baby!! 🤫\n";
+              responseText += "🔑 You are the owner - exempt from all rules";
+              await sock.sendMessage(groupJid, { text: responseText });
+            } catch (e) {}
+          }
+          return; // Owner is exempt - don't check violations
+        }
+
         const visibleText = extractVisibleText(msg).trim();
         const textLower = visibleText.toLowerCase();
 
-        // !bot command
+        // !bot command from others
         if (textLower === "!bot") {
           console.log("📨 !bot command from:", senderJid);
           try {
             let responseText = "✅ ANTI-LINK BOT ACTIVE\n";
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
             responseText += "📋 Mode: All groups\n";
-            responseText += "💃 We R 🆗 Baby!! 🤫\n";
-            if (isOwner(senderJid)) {
-              responseText += "🔑 You are the owner - exempt from all rules";
-            }
+            responseText += "💃 We R 🆗 Baby!! 🤫";
             await sock.sendMessage(groupJid, { text: responseText });
           } catch (e) {
             console.log("⚠️ Could not send !bot reply:", e?.message);
@@ -574,12 +580,9 @@ async function startBot() {
           return;
         }
 
-        // Skip bot's own messages
-        if (msg.key.fromMe) return;
-        
-        // OWNER IS EXEMPT FROM ALL RULES
+        // Double-check owner by JID (for messages from other devices)
         if (isOwner(senderJid)) {
-          return; // Owner can send anything!
+          return; // Owner exempt
         }
 
         const dup = checkDuplicate(groupJid, senderJid, visibleText);
