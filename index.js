@@ -25,6 +25,8 @@ http.createServer((req, res) => {
   res.end("Anti-Link Bot Running");
 }).listen(PORT, () => console.log("Health server on port " + PORT));
 
+// IMPORTANT CHANGE:
+// Track strikes by normalized phone (not raw JID) so device-variants don't create new strike buckets.
 const userViolations = new Map();
 const notAdminGroups = new Map();
 const NOT_ADMIN_CACHE_TTL = 60 * 60 * 1000;
@@ -589,17 +591,32 @@ async function startBot() {
         }
 
         // ===== OWNER EXEMPTION (deterministic) =====
+        const senderPhone = extractPhoneNumber(senderJid);
         const owner = isOwner(senderJid);
         const self = isSelfMessage(msg);
 
-        if (self || owner) {
-          if (DEBUG_MODE) {
-            console.log("👑 Exempt message - skipping checks");
-            console.log("   fromMe:", !!msg.key.fromMe);
-            console.log("   sender:", senderJid);
-            console.log("   BOT_SELF_JID:", BOT_SELF_JID);
-            console.log("   owner:", owner, "self:", self);
-          }
+        // HARD OWNER FIREWALL: if sender resolves to owner/self phone, stop immediately.
+        // This protects against any edge-case where JID formats differ.
+        const hardOwner = (senderPhone && normalizeNumber(senderPhone) && (
+          normalizeNumber(senderPhone) === normalizeNumber(ADMIN_NUMBER) ||
+          (BOT_SELF_PHONE && normalizeNumber(senderPhone) === normalizeNumber(BOT_SELF_PHONE))
+        ));
+
+        if (DEBUG_MODE) {
+          console.log("🧾 owner-check:", {
+            senderJid,
+            senderPhone,
+            fromMe: !!msg.key.fromMe,
+            admin: ADMIN_NUMBER,
+            botSelfPhone: BOT_SELF_PHONE,
+            owner,
+            self,
+            hardOwner
+          });
+        }
+
+        if (self || owner || hardOwner) {
+          if (DEBUG_MODE) console.log("👑 Exempt message - skipping checks");
           return;
         }
 
@@ -630,7 +647,9 @@ async function startBot() {
         if (buttons) reasons.push("buttons");
         if (contact) reasons.push("contact");
 
-        const userKey = groupJid + "-" + senderJid;
+        // Use normalized phone for strike key to avoid device JID variations
+        const strikeId = senderPhone || senderJid;
+        const userKey = groupJid + "-" + strikeId;
         const current = userViolations.get(userKey) || 0;
         const updated = current + 1;
         userViolations.set(userKey, updated);
