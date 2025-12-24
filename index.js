@@ -1,4 +1,4 @@
-// Anti-Link Bot v2.9.2 - Owner Exempt Fix + Session Persistence
+// Anti-Link Bot v2.9.3 - Deterministic Owner Exempt + Session Persistence
 
 const {
   default: makeWASocket,
@@ -13,7 +13,8 @@ const fs = require("fs");
 const path = require("path");
 const http = require("http");
 
-const ADMIN_NUMBER = "254106090661";
+// IMPORTANT: Put your number in env ADMIN_NUMBER too, to avoid edits
+const ADMIN_NUMBER = process.env.ADMIN_NUMBER || "254106090661";
 const DEBUG_MODE = true;
 const AUTH_FOLDER = "./auth_info";
 
@@ -34,6 +35,10 @@ const DUP_BLOCK_FROM = 2;
 
 let hasConnectedBefore = false;
 
+// Deterministic: we learn the bot's own JID once connected
+let BOT_SELF_JID = "";
+let BOT_SELF_PHONE = "";
+
 const createSilentLogger = () => {
   const noOp = () => {};
   return {
@@ -43,7 +48,6 @@ const createSilentLogger = () => {
   };
 };
 
-// Encryption key - exactly 32 bytes using SHA-256 hash
 function getEncryptionKey() {
   const key = process.env.SESSION_KEY || "AntiLinkBotDefaultKey2024SecureX";
   return crypto.createHash("sha256").update(key).digest();
@@ -77,7 +81,6 @@ function decrypt(text) {
   }
 }
 
-// Restore session from environment variable
 function restoreSessionFromEnv() {
   try {
     const encrypted = process.env.WHATSAPP_SESSION;
@@ -85,24 +88,22 @@ function restoreSessionFromEnv() {
       console.log("ℹ️ No saved session found in environment variables");
       return false;
     }
-    
+
     console.log("🔄 Restoring session from environment variable...");
     const decrypted = decrypt(encrypted);
     if (!decrypted) {
       console.log("❌ Failed to decrypt session");
       return false;
     }
-    
+
     const sessionData = JSON.parse(decrypted);
-    if (!fs.existsSync(AUTH_FOLDER)) {
-      fs.mkdirSync(AUTH_FOLDER, { recursive: true });
-    }
-    
+    if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+
     for (const [filename, content] of Object.entries(sessionData)) {
       const filePath = path.join(AUTH_FOLDER, filename);
       fs.writeFileSync(filePath, JSON.stringify(content, null, 2));
     }
-    
+
     console.log("✅ Session restored successfully!");
     return true;
   } catch (error) {
@@ -114,24 +115,23 @@ function restoreSessionFromEnv() {
 function saveSessionToEnv() {
   try {
     if (!fs.existsSync(AUTH_FOLDER)) return;
-    
+
     const files = fs.readdirSync(AUTH_FOLDER);
     const sessionData = {};
-    
+
     for (const file of files) {
-      if (file.endsWith(".json")) {
-        try {
-          const content = fs.readFileSync(path.join(AUTH_FOLDER, file), "utf8");
-          sessionData[file] = JSON.parse(content);
-        } catch (e) {}
-      }
+      if (!file.endsWith(".json")) continue;
+      try {
+        const content = fs.readFileSync(path.join(AUTH_FOLDER, file), "utf8");
+        sessionData[file] = JSON.parse(content);
+      } catch (e) {}
     }
-    
+
     if (Object.keys(sessionData).length === 0) return;
-    
+
     const encrypted = encrypt(JSON.stringify(sessionData));
     if (!encrypted) return;
-    
+
     console.log("");
     console.log("=".repeat(60));
     console.log("📁 COPY THIS SESSION DATA TO RENDER ENVIRONMENT VARIABLE:");
@@ -141,9 +141,8 @@ function saveSessionToEnv() {
     console.log(encrypted);
     console.log("=".repeat(60));
     console.log("1. Go to Render Dashboard → Your Service → Environment");
-    console.log("2. Add Environment Variable: WHATSAPP_SESSION");
+    console.log("2. Add/Update Environment Variable: WHATSAPP_SESSION");
     console.log("3. Paste the value above");
-    console.log("4. Redeploy (optional)");
     console.log("=".repeat(60));
     console.log("");
   } catch (error) {
@@ -151,19 +150,59 @@ function saveSessionToEnv() {
   }
 }
 
+function normalizeNumber(s) {
+  return String(s || "").replace(/\D/g, "");
+}
+
 function extractPhoneNumber(jid) {
   if (!jid) return "";
   let clean = String(jid).split("@")[0];
   clean = clean.split(":")[0];
-  return clean.replace(/\D/g, "");
+  return normalizeNumber(clean);
 }
 
-// Check if sender is the owner
+function jidMatchesNumber(senderJid, phoneDigits) {
+  if (!senderJid || !phoneDigits) return false;
+  const sj = String(senderJid);
+  const digits = extractPhoneNumber(senderJid);
+  const target = normalizeNumber(phoneDigits);
+  if (!target) return false;
+
+  // Common cases:
+  // - 2547xxxx@s.whatsapp.net
+  // - 2547xxxx:device@s.whatsapp.net
+  // - sometimes senderJid contains the digits
+  if (digits === target) return true;
+  if (sj.includes(target)) return true;
+
+  // if some users put leading 0 locally; allow last 9 digits match
+  if (digits.length >= 9 && target.length >= 9) {
+    if (digits.slice(-9) === target.slice(-9)) return true;
+  }
+
+  return false;
+}
+
 function isOwner(senderJid) {
-  if (!senderJid) return false;
-  const phone = extractPhoneNumber(senderJid);
-  if (phone === ADMIN_NUMBER) return true;
-  if (String(senderJid).includes(ADMIN_NUMBER)) return true;
+  // Deterministic owner check:
+  // 1) match sender to ADMIN_NUMBER
+  // 2) match sender to BOT_SELF_PHONE (the account running the bot)
+  if (jidMatchesNumber(senderJid, ADMIN_NUMBER)) return true;
+  if (BOT_SELF_PHONE && jidMatchesNumber(senderJid, BOT_SELF_PHONE)) return true;
+  return false;
+}
+
+function isSelfMessage(msg) {
+  // Some clients set fromMe weirdly; we check multiple signals.
+  if (!msg?.key) return false;
+  if (msg.key.fromMe) return true;
+
+  const sender = msg.key.participant || msg.key.remoteJid;
+  if (BOT_SELF_JID && sender === BOT_SELF_JID) return true;
+
+  // if we know bot phone, match against sender
+  if (BOT_SELF_PHONE && jidMatchesNumber(sender, BOT_SELF_PHONE)) return true;
+
   return false;
 }
 
@@ -196,29 +235,22 @@ function isZipFile(msg) {
   return false;
 }
 
-// Audio file detection (not voice calls or video)
 function isAudioFile(msg) {
   const m = msg.message || {};
-  
-  // Direct audio message (voice notes, audio files)
   if (m.audioMessage) return true;
-  
-  // View-once audio
+
   const vo = m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m.viewOnceMessageV2Extension?.message;
   if (vo?.audioMessage) return true;
-  
-  // Audio sent as document
+
   const doc = m.documentMessage;
   if (doc) {
     const mimetype = (doc.mimetype || "").toLowerCase();
     const fileName = (doc.fileName || doc.title || "").toLowerCase();
-    
     if (mimetype.startsWith("audio/")) return true;
-    
     const audioExtensions = [".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac", ".wma", ".opus"];
     if (audioExtensions.some(ext => fileName.endsWith(ext))) return true;
   }
-  
+
   return false;
 }
 
@@ -378,9 +410,8 @@ function cleanupCaches() {
 
 async function startBot() {
   try {
-    // RESTORE SESSION FIRST
     restoreSessionFromEnv();
-    
+
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
     const keyStore = makeCacheableSignalKeyStore(state.keys, createSilentLogger());
 
@@ -401,14 +432,11 @@ async function startBot() {
       msgRetryCounterCache: new Map(),
     });
 
-    // Request pairing code if not registered
     if (!state.creds.registered) {
       console.log("");
       console.log("📱 Requesting pairing code for: " + ADMIN_NUMBER);
       console.log("⏳ Please wait...");
-      
       await new Promise(r => setTimeout(r, 3000));
-      
       try {
         const code = await sock.requestPairingCode(ADMIN_NUMBER);
         console.log("");
@@ -437,43 +465,49 @@ async function startBot() {
     });
 
     sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      const { connection, lastDisconnect } = update;
 
       if (connection === "open") {
         hasConnectedBefore = true;
+
+        BOT_SELF_JID = sock.user?.id || "";
+        BOT_SELF_PHONE = extractPhoneNumber(BOT_SELF_JID);
+
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
         console.log("║ ✅ ANTI-LINK BOT ONLINE                  ║");
         console.log("╠══════════════════════════════════════════╣");
-        console.log("║ 🤖 Bot: " + (sock.user?.id || "unknown").substring(0,30).padEnd(31) + "║");
-        console.log("║ 👑 Owner: " + ADMIN_NUMBER.padEnd(30) + "║");
+        console.log("║ 🤖 Bot: " + (BOT_SELF_JID || "unknown").substring(0,30).padEnd(31) + "║");
+        console.log("║ 👑 Owner: " + String(ADMIN_NUMBER).padEnd(30) + "║");
         console.log("║ 📋 Mode: All groups                      ║");
         console.log("║ 💃 We R 🆗 Baby!! 🤫                     ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
+
+        if (DEBUG_MODE) {
+          console.log("🔎 Debug owner match targets:");
+          console.log("- ADMIN_NUMBER: " + ADMIN_NUMBER);
+          console.log("- BOT_SELF_JID: " + BOT_SELF_JID);
+          console.log("- BOT_SELF_PHONE: " + BOT_SELF_PHONE);
+        }
+
         saveSessionToEnv();
       }
 
       if (connection === "close") {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const reason = lastDisconnect?.error?.message || "unknown";
-        
+
         console.log("🔌 Connection closed: " + reason);
-        
+
         if (statusCode === DisconnectReason.loggedOut) {
           console.log("❌ Logged out. Delete WHATSAPP_SESSION env var and redeploy.");
-          if (fs.existsSync(AUTH_FOLDER)) {
-            fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
-          }
+          if (fs.existsSync(AUTH_FOLDER)) fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
         } else {
           const delay = hasConnectedBefore ? 5000 : 10000;
           console.log("🔄 Reconnecting in " + (delay/1000) + " seconds...");
           setTimeout(() => startBot().catch(console.error), delay);
         }
-      }
-
-      if (qr) {
-        console.log("📱 QR Code received - but we're using pairing code instead");
       }
     });
 
@@ -513,6 +547,12 @@ async function startBot() {
 
     async function safeRemove(groupJid, userJid) {
       try {
+        // SAFEGUARD: never remove owner
+        if (jidMatchesNumber(userJid, ADMIN_NUMBER) || (BOT_SELF_PHONE && jidMatchesNumber(userJid, BOT_SELF_PHONE))) {
+          console.log("🛡️ Refused to remove owner/self");
+          return false;
+        }
+
         await sock.groupParticipantsUpdate(groupJid, [userJid], "remove");
         console.log("✅ User removed from group");
         return true;
@@ -524,7 +564,6 @@ async function startBot() {
 
     async function handleMessage(msg) {
       try {
-        // Only process group messages
         if (!msg?.key?.remoteJid?.endsWith("@g.us")) return;
         if (!msg.message) return;
 
@@ -533,17 +572,14 @@ async function startBot() {
         const visibleText = extractVisibleText(msg).trim();
         const textLower = visibleText.toLowerCase();
 
-        // ===== CHECK !bot COMMAND FIRST (before any exemption) =====
+        // !bot command (keep your preferred format, no version)
         if (textLower === "!bot") {
           console.log("📨 !bot command from:", senderJid);
           try {
             let responseText = "✅ ANTI-LINK BOT ACTIVE\n";
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
             responseText += "📋 Mode: All groups\n";
-            responseText += "💃 We R 🆗 Baby!! 🤫";
-            if (msg.key.fromMe || isOwner(senderJid)) {
-              responseText += "\n🔑 You are the owner - exempt from all rules";
-            }
+            responseText += "💃 We R 🆗 Baby!! 🤫\n";
             await sock.sendMessage(groupJid, { text: responseText });
             console.log("✅ Sent !bot response");
           } catch (e) {
@@ -552,16 +588,18 @@ async function startBot() {
           return;
         }
 
-        // ===== OWNER EXEMPTION: Check BOTH fromMe AND isOwner =====
-        // If message is from bot itself (linked to your account)
-        if (msg.key.fromMe) {
-          if (DEBUG_MODE) console.log("👑 Owner message (fromMe) - exempt");
-          return;
-        }
-        
-        // If sender JID matches owner number (backup check for apps)
-        if (isOwner(senderJid)) {
-          if (DEBUG_MODE) console.log("👑 Owner message (isOwner) - exempt");
+        // ===== OWNER EXEMPTION (deterministic) =====
+        const owner = isOwner(senderJid);
+        const self = isSelfMessage(msg);
+
+        if (self || owner) {
+          if (DEBUG_MODE) {
+            console.log("👑 Exempt message - skipping checks");
+            console.log("   fromMe:", !!msg.key.fromMe);
+            console.log("   sender:", senderJid);
+            console.log("   BOT_SELF_JID:", BOT_SELF_JID);
+            console.log("   owner:", owner, "self:", self);
+          }
           return;
         }
 
