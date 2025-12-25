@@ -41,6 +41,12 @@ let hasConnectedBefore = false;
 let BOT_SELF_JID = "";
 let BOT_SELF_PHONE = "";
 
+// Some WhatsApp clients expose sender as @lid (Linked-ID), not phone.
+// If your messages appear as @lid with fromMe:false, set OWNER_LID to your @lid.
+// You can hardcode it here or override via env OWNER_LID.
+// IMPORTANT: Your logs show: 22793995452644@lid
+let OWNER_LID = process.env.OWNER_LID || "22793995452644@lid";
+
 const createSilentLogger = () => {
   const noOp = () => {};
   return {
@@ -195,6 +201,13 @@ function isLidJid(jid) {
   return String(jid || "").endsWith("@lid");
 }
 
+function isOwnerLid(senderJid) {
+  if (!senderJid) return false;
+  if (!isLidJid(senderJid)) return false;
+  if (!OWNER_LID) return false;
+  return String(senderJid) === String(OWNER_LID);
+}
+
 function isSelfMessage(msg) {
   // Multi-device reality:
   // - fromMe is the strongest signal (even if participant is @lid)
@@ -213,11 +226,17 @@ function isSelfMessage(msg) {
 
 function isExempt(msg) {
   // Single place to decide exemption.
-  // IMPORTANT: @lid participants often won't match phone numbers; fromMe must win.
+  // IMPORTANT: @lid participants often won't match phone numbers.
+  // Priority:
+  // 1) fromMe (strongest)
+  // 2) learned OWNER_LID match
+  // 3) phone-based owner/self
+  // 4) exact self JID
   if (!msg?.key) return false;
   if (msg.key.fromMe) return true;
 
   const senderJid = msg.key.participant || msg.key.remoteJid;
+  if (isOwnerLid(senderJid)) return true;
   if (isOwner(senderJid)) return true;
   if (BOT_SELF_JID && senderJid === BOT_SELF_JID) return true;
   if (BOT_SELF_PHONE && jidMatchesNumber(senderJid, BOT_SELF_PHONE)) return true;
@@ -602,10 +621,19 @@ async function startBot() {
         // !bot command (keep your preferred format, no version)
         if (textLower === "!bot") {
           console.log("📨 !bot command from:", senderJid);
+
+          // Learn owner's LID if present (fixes cases where your messages come as @lid with fromMe:false)
+          // If OWNER_LID is already set/hardcoded, we keep it.
+          if (isLidJid(senderJid) && (!OWNER_LID || OWNER_LID === "")) {
+            OWNER_LID = String(senderJid);
+            console.log("🔐 Learned OWNER_LID:", OWNER_LID);
+            console.log("ℹ️ Save this in Render env var OWNER_LID to persist across restarts.");
+          }
+
           try {
             let responseText = "✅ ANTI-LINK BOT ACTIVE\n";
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
-            responseText += "📋 Mode: All groups\n";
+          
             responseText += "💃 We R 🆗 Baby!! 🤫\n";
             await sock.sendMessage(groupJid, { text: responseText });
             console.log("✅ Sent !bot response");
@@ -621,11 +649,16 @@ async function startBot() {
         const self = isSelfMessage(msg);
         const exempt = isExempt(msg);
 
-        // HARD OWNER FIREWALL (phone-based). Note: @lid has no phone, so exempt relies on fromMe.
-        const hardOwner = (senderPhone && (
-          normalizeNumber(senderPhone) === normalizeNumber(ADMIN_NUMBER) ||
-          (BOT_SELF_PHONE && normalizeNumber(senderPhone) === normalizeNumber(BOT_SELF_PHONE))
-        ));
+        // HARD OWNER FIREWALL
+        // 1) Phone-based match (normal JIDs)
+        // 2) OWNER_LID match (for @lid senders where fromMe can be false)
+        const hardOwner = (
+          (senderPhone && (
+            normalizeNumber(senderPhone) === normalizeNumber(ADMIN_NUMBER) ||
+            (BOT_SELF_PHONE && normalizeNumber(senderPhone) === normalizeNumber(BOT_SELF_PHONE))
+          )) ||
+          isOwnerLid(senderJid)
+        );
 
         if (DEBUG_MODE) {
           console.log("🧾 owner-check:", {
@@ -636,6 +669,8 @@ async function startBot() {
             botSelfJid: BOT_SELF_JID,
             botSelfPhone: BOT_SELF_PHONE,
             owner,
+            ownerLid: isOwnerLid(senderJid),
+            ownerLidValue: OWNER_LID,
             self,
             exempt,
             hardOwner,
