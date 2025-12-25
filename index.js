@@ -170,14 +170,9 @@ function jidMatchesNumber(senderJid, phoneDigits) {
   const target = normalizeNumber(phoneDigits);
   if (!target) return false;
 
-  // Common cases:
-  // - 2547xxxx@s.whatsapp.net
-  // - 2547xxxx:device@s.whatsapp.net
-  // - sometimes senderJid contains the digits
   if (digits === target) return true;
   if (sj.includes(target)) return true;
 
-  // if some users put leading 0 locally; allow last 9 digits match
   if (digits.length >= 9 && target.length >= 9) {
     if (digits.slice(-9) === target.slice(-9)) return true;
   }
@@ -186,16 +181,24 @@ function jidMatchesNumber(senderJid, phoneDigits) {
 }
 
 function isOwner(senderJid) {
-  // Deterministic owner check:
-  // 1) match sender to ADMIN_NUMBER
-  // 2) match sender to BOT_SELF_PHONE (the account running the bot)
+  // Deterministic owner check (phone-based):
+  // - ADMIN_NUMBER: your number
+  // - BOT_SELF_PHONE: the phone number of the WhatsApp account the bot is logged into
+  // Note: some clients show participants as @lid (not phone). In those cases,
+  // we rely on isSelfMessage(msg) and hardOwner firewall in handleMessage.
   if (jidMatchesNumber(senderJid, ADMIN_NUMBER)) return true;
   if (BOT_SELF_PHONE && jidMatchesNumber(senderJid, BOT_SELF_PHONE)) return true;
   return false;
 }
 
+function isLidJid(jid) {
+  return String(jid || "").endsWith("@lid");
+}
+
 function isSelfMessage(msg) {
-  // Some clients set fromMe weirdly; we check multiple signals.
+  // Multi-device reality:
+  // - fromMe is the strongest signal (even if participant is @lid)
+  // - participant/remoteJid can be group, or @lid, or phone@s.whatsapp.net
   if (!msg?.key) return false;
   if (msg.key.fromMe) return true;
 
@@ -204,6 +207,20 @@ function isSelfMessage(msg) {
 
   // if we know bot phone, match against sender
   if (BOT_SELF_PHONE && jidMatchesNumber(sender, BOT_SELF_PHONE)) return true;
+
+  return false;
+}
+
+function isExempt(msg) {
+  // Single place to decide exemption.
+  // IMPORTANT: @lid participants often won't match phone numbers; fromMe must win.
+  if (!msg?.key) return false;
+  if (msg.key.fromMe) return true;
+
+  const senderJid = msg.key.participant || msg.key.remoteJid;
+  if (isOwner(senderJid)) return true;
+  if (BOT_SELF_JID && senderJid === BOT_SELF_JID) return true;
+  if (BOT_SELF_PHONE && jidMatchesNumber(senderJid, BOT_SELF_PHONE)) return true;
 
   return false;
 }
@@ -549,7 +566,15 @@ async function startBot() {
 
     async function safeRemove(groupJid, userJid) {
       try {
-        // SAFEGUARD: never remove owner
+        // SAFEGUARD: never remove owner/self/bot (even if a JID is @lid or device variant)
+        if (!userJid) return false;
+
+        if (BOT_SELF_JID && String(userJid) === String(BOT_SELF_JID)) {
+          console.log("🛡️ Refused to remove bot self");
+          return false;
+        }
+
+        // If userJid contains a phone-like identity, protect owner/self
         if (jidMatchesNumber(userJid, ADMIN_NUMBER) || (BOT_SELF_PHONE && jidMatchesNumber(userJid, BOT_SELF_PHONE))) {
           console.log("🛡️ Refused to remove owner/self");
           return false;
@@ -590,14 +615,14 @@ async function startBot() {
           return;
         }
 
-        // ===== OWNER EXEMPTION (deterministic) =====
+        // ===== OWNER/SELF EXEMPTION (single source of truth) =====
         const senderPhone = extractPhoneNumber(senderJid);
         const owner = isOwner(senderJid);
         const self = isSelfMessage(msg);
+        const exempt = isExempt(msg);
 
-        // HARD OWNER FIREWALL: if sender resolves to owner/self phone, stop immediately.
-        // This protects against any edge-case where JID formats differ.
-        const hardOwner = (senderPhone && normalizeNumber(senderPhone) && (
+        // HARD OWNER FIREWALL (phone-based). Note: @lid has no phone, so exempt relies on fromMe.
+        const hardOwner = (senderPhone && (
           normalizeNumber(senderPhone) === normalizeNumber(ADMIN_NUMBER) ||
           (BOT_SELF_PHONE && normalizeNumber(senderPhone) === normalizeNumber(BOT_SELF_PHONE))
         ));
@@ -608,14 +633,18 @@ async function startBot() {
             senderPhone,
             fromMe: !!msg.key.fromMe,
             admin: ADMIN_NUMBER,
+            botSelfJid: BOT_SELF_JID,
             botSelfPhone: BOT_SELF_PHONE,
             owner,
             self,
-            hardOwner
+            exempt,
+            hardOwner,
+            senderIsLid: isLidJid(senderJid)
           });
         }
 
-        if (self || owner || hardOwner) {
+        // Absolute exemption: if fromMe OR owner/self, do nothing (no violations, no strikes).
+        if (exempt || hardOwner) {
           if (DEBUG_MODE) console.log("👑 Exempt message - skipping checks");
           return;
         }
@@ -647,7 +676,8 @@ async function startBot() {
         if (buttons) reasons.push("buttons");
         if (contact) reasons.push("contact");
 
-        // Use normalized phone for strike key to avoid device JID variations
+        // Use normalized phone for strike key to avoid device JID variations.
+        // If no phone (e.g. @lid), fall back to senderJid.
         const strikeId = senderPhone || senderJid;
         const userKey = groupJid + "-" + strikeId;
         const current = userViolations.get(userKey) || 0;
