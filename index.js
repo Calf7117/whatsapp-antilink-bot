@@ -1,4 +1,4 @@
-// Anti-Link Bot v3.0 - Extreme Anti-Spam with Backchecking
+// Anti-Link Bot v2.9.3 - Deterministic Owner Exempt + Session Persistence
 
 const {
   default: makeWASocket,
@@ -25,16 +25,34 @@ http.createServer((req, res) => {
   res.end("Anti-Link Bot Running");
 }).listen(PORT, () => console.log("Health server on port " + PORT));
 
-// EXTREME MEASURES: Track EVERYTHING
+// IMPORTANT CHANGE:
+// Track strikes by normalized phone (not raw JID) so device-variants don't create new strike buckets.
 const userViolations = new Map();
 const notAdminGroups = new Map();
 const NOT_ADMIN_CACHE_TTL = 60 * 60 * 1000;
 
 const recentMessages = new Map();
-const messageHistory = new Map(); // NEW: Store last N messages per group for backchecking
-const DUP_WINDOW_MS = 120000; // 2 minutes window (extended)
-const DUP_BLOCK_FROM = 1; // Block after 1 duplicate (extreme!)
-const MAX_HISTORY_PER_GROUP = 50; // Keep last 50 messages per group
+const DUP_WINDOW_MS = 30000;
+const DUP_BLOCK_FROM = 2;
+
+// ===== Flood & throughput hardening (anti-coordinated spam) =====
+// 1) Sender-based flood ban: if a sender posts more than FLOOD_MAX_MSG in FLOOD_WINDOW_MS => queued immediate remove
+const senderRate = new Map();
+const floodBanned = new Map();
+const FLOOD_WINDOW_MS = 3000;
+const FLOOD_MAX_MSG = 5;
+const FLOOD_BAN_TTL_MS = 60000;
+
+// 3) Bulk moderation: buffer deletes/removal per sender to reduce API churn under flood
+const pendingActions = new Map();
+const BULK_DELAY_MS = 600;
+const DELETE_PARALLEL = 6;
+
+// 2) Optimized queue processing: drain in parallel batches with a hard concurrency limit
+const incomingQueue = [];
+let drainingQueue = false;
+const QUEUE_BATCH_SIZE = 25;
+const QUEUE_PARALLEL = 8;
 
 let hasConnectedBefore = false;
 
@@ -42,12 +60,11 @@ let hasConnectedBefore = false;
 let BOT_SELF_JID = "";
 let BOT_SELF_PHONE = "";
 
+// Some WhatsApp clients expose sender as @lid (Linked-ID), not phone.
+// If your messages appear as @lid with fromMe:false, set OWNER_LID to your @lid.
+// You can hardcode it here or override via env OWNER_LID.
+// IMPORTANT: Your logs show: 22793995452644@lid
 let OWNER_LID = process.env.OWNER_LID || "22793995452644@lid";
-
-// NEW: Queue system to handle rapid messages without hanging
-const messageQueue = [];
-let isProcessingQueue = false;
-const MAX_QUEUE_SIZE = 100;
 
 const createSilentLogger = () => {
   const noOp = () => {};
@@ -189,6 +206,11 @@ function jidMatchesNumber(senderJid, phoneDigits) {
 }
 
 function isOwner(senderJid) {
+  // Deterministic owner check (phone-based):
+  // - ADMIN_NUMBER: your number
+  // - BOT_SELF_PHONE: the phone number of the WhatsApp account the bot is logged into
+  // Note: some clients show participants as @lid (not phone). In those cases,
+  // we rely on isSelfMessage(msg) and hardOwner firewall in handleMessage.
   if (jidMatchesNumber(senderJid, ADMIN_NUMBER)) return true;
   if (BOT_SELF_PHONE && jidMatchesNumber(senderJid, BOT_SELF_PHONE)) return true;
   return false;
@@ -206,18 +228,29 @@ function isOwnerLid(senderJid) {
 }
 
 function isSelfMessage(msg) {
+  // Multi-device reality:
+  // - fromMe is the strongest signal (even if participant is @lid)
+  // - participant/remoteJid can be group, or @lid, or phone@s.whatsapp.net
   if (!msg?.key) return false;
   if (msg.key.fromMe) return true;
 
   const sender = msg.key.participant || msg.key.remoteJid;
   if (BOT_SELF_JID && sender === BOT_SELF_JID) return true;
 
+  // if we know bot phone, match against sender
   if (BOT_SELF_PHONE && jidMatchesNumber(sender, BOT_SELF_PHONE)) return true;
 
   return false;
 }
 
 function isExempt(msg) {
+  // Single place to decide exemption.
+  // IMPORTANT: @lid participants often won't match phone numbers.
+  // Priority:
+  // 1) fromMe (strongest)
+  // 2) learned OWNER_LID match
+  // 3) phone-based owner/self
+  // 4) exact self JID
   if (!msg?.key) return false;
   if (msg.key.fromMe) return true;
 
@@ -230,46 +263,12 @@ function isExempt(msg) {
   return false;
 }
 
-// EXTREME: Enhanced link detection for short URLs like abr.ge
+// Fast path: single precompiled regex for speed during heavy load
+const FAST_LINK_REGEX = /(?:https?:\/\/|www\.)\S+|\b(?:wa\.me|whatsapp\.com)\/\S+|\b[A-Za-z0-9-]{1,63}\.(?:com|net|org|io|co|me|app|tech|info|biz|store|online|ly|ge|ke|uk|us|tv|gg|site|blog|news|vip|link)(?:\/\S*)?\b/i;
+
 function detectLinks(text) {
   if (!text) return false;
-  
-  // STRONG patterns for common URL formats
-  const patterns = [
-    /https?:\/\/[^\s]+/i,  // http/https links
-    /www\.[^\s]+/i,        // www links
-    /\b(?:wa\.me|whatsapp\.com)\/\S+/i,  // WhatsApp links
-    /\b[A-Za-z0-9-]{2,20}\.(?:com|net|org|io|co|me|app|tech|info|biz|store|online|ly|ge|ke|uk|us|tv|gg|site|blog|news|xyz|club|top|fun|shop|click|link|live)(?:\/[^\s]*)?\b/i,  // Domain detection
-    /\b[a-z0-9]{2,12}\.[a-z]{2,6}\/[a-z0-9]+\b/i,  // Short URLs like abr.ge/fa8zc73
-  ];
-  
-  return patterns.some((r) => r.test(text));
-}
-
-// NEW: Extract and normalize URLs for better duplicate detection
-function extractAndNormalizeUrls(text) {
-  if (!text) return [];
-  
-  const urlPattern = /(https?:\/\/[^\s]+)|(www\.[^\s]+)|(\b[a-z0-9-]{2,20}\.[a-z]{2,6}(?:\/[^\s]*)?\b)/gi;
-  const matches = text.match(urlPattern) || [];
-  
-  return matches.map(url => {
-    // Normalize URLs: remove protocol, www, trailing slashes
-    let normalized = url.toLowerCase()
-      .replace(/^(https?:\/\/)?(www\.)?/, '')
-      .replace(/\/+$/, '');
-    
-    // For short domains, keep path as part of identifier
-    if (normalized.includes('.ge/') || 
-        normalized.includes('.ly/') || 
-        normalized.includes('.me/') ||
-        normalized.split('/')[0].length <= 6) { // Very short domains
-      return normalized;
-    }
-    
-    // For regular domains, just use domain for matching
-    return normalized.split('/')[0];
-  });
+  return FAST_LINK_REGEX.test(text);
 }
 
 function detectPhoneNumbers(text) {
@@ -430,173 +429,51 @@ function isContactMessage(msg) {
   return false;
 }
 
-// NEW: Enhanced duplicate detection with URL normalization
 function checkDuplicate(groupJid, senderJid, visibleText) {
   const text = (visibleText || "").trim().toLowerCase();
-  
-  // Extract and normalize URLs
-  const urls = extractAndNormalizeUrls(visibleText);
-  const urlKey = urls.length > 0 ? urls.sort().join('|') : '';
-  
+  if (!text || text.length < 5) return { isDuplicate: false, count: 0 };
+
   const key = groupJid + "-" + senderJid;
   const now = Date.now();
   const prev = recentMessages.get(key);
 
-  // If no previous message or window expired
   if (!prev || (now - prev.ts) > DUP_WINDOW_MS) {
-    recentMessages.set(key, { 
-      last: text, 
-      urls: urlKey,
-      count: 1, 
-      ts: now 
-    });
-    return { isDuplicate: false, count: 1, isUrlDuplicate: false };
+    recentMessages.set(key, { last: text, count: 1, ts: now });
+    return { isDuplicate: false, count: 1 };
   }
 
-  // Check for exact text match
   if (prev.last === text) {
     prev.count += 1;
     prev.ts = now;
-    return { 
-      isDuplicate: prev.count >= DUP_BLOCK_FROM, 
-      count: prev.count,
-      isUrlDuplicate: false 
-    };
-  }
-  
-  // Check for URL match (even if text is different)
-  if (urlKey && prev.urls === urlKey) {
-    prev.count += 1;
-    prev.ts = now;
-    prev.last = text; // Update last text
-    return { 
-      isDuplicate: prev.count >= DUP_BLOCK_FROM, 
-      count: prev.count,
-      isUrlDuplicate: true 
-    };
+    return { isDuplicate: prev.count >= DUP_BLOCK_FROM, count: prev.count };
   }
 
-  // New message
-  recentMessages.set(key, { 
-    last: text, 
-    urls: urlKey,
-    count: 1, 
-    ts: now 
-  });
-  return { isDuplicate: false, count: 1, isUrlDuplicate: false };
-}
-
-// NEW: Add message to history for backchecking
-function addToHistory(groupJid, msg) {
-  if (!messageHistory.has(groupJid)) {
-    messageHistory.set(groupJid, []);
-  }
-  
-  const history = messageHistory.get(groupJid);
-  history.push({
-    msg,
-    timestamp: Date.now(),
-    processed: false
-  });
-  
-  // Keep only last N messages
-  if (history.length > MAX_HISTORY_PER_GROUP) {
-    history.shift();
-  }
-}
-
-// NEW: Check recent messages for violations (backchecking)
-function checkRecentViolations(groupJid, senderJid, sock) {
-  if (!messageHistory.has(groupJid)) return;
-  
-  const history = messageHistory.get(groupJid);
-  const now = Date.now();
-  const checkWindow = 10000; // 10 seconds
-  
-  let violationsFound = 0;
-  
-  // Check last 15 messages from this sender
-  const recentFromSender = history
-    .filter(item => {
-      const itemSender = item.msg.key.participant || item.msg.key.remoteJid;
-      return itemSender === senderJid && 
-             !item.processed && 
-             (now - item.timestamp) <= checkWindow;
-    })
-    .slice(-15); // Last 15 messages
-  
-  console.log(`🔍 Backchecking ${recentFromSender.length} recent messages from ${senderJid}`);
-  
-  // Process each unprocessed message
-  recentFromSender.forEach(item => {
-    if (!item.processed) {
-      // Mark as processed to avoid infinite loops
-      item.processed = true;
-      
-      const visibleText = extractVisibleText(item.msg).trim();
-      const hasLink = detectLinks(visibleText);
-      
-      if (hasLink) {
-        violationsFound++;
-        console.log(`⚠️ Found missed violation in backcheck: ${visibleText.substring(0, 50)}...`);
-        
-        // Queue for deletion (but don't wait)
-        setTimeout(() => {
-          safeDelete(groupJid, item.msg.key, sock).catch(() => {});
-        }, 100);
-      }
-    }
-  });
-  
-  return violationsFound;
+  recentMessages.set(key, { last: text, count: 1, ts: now });
+  return { isDuplicate: false, count: 1 };
 }
 
 function cleanupCaches() {
   const now = Date.now();
-  
-  // Clean recentMessages
   for (const [k, v] of recentMessages.entries()) {
     if ((now - v.ts) > DUP_WINDOW_MS * 3) recentMessages.delete(k);
   }
-  
-  // Clean notAdminGroups
   for (const [k, v] of notAdminGroups.entries()) {
     if ((now - v) > NOT_ADMIN_CACHE_TTL) notAdminGroups.delete(k);
   }
-  
-  // Clean messageHistory (keep only last 5 minutes)
-  for (const [groupJid, history] of messageHistory.entries()) {
-    const filtered = history.filter(item => (now - item.timestamp) <= 300000);
-    if (filtered.length === 0) {
-      messageHistory.delete(groupJid);
-    } else {
-      messageHistory.set(groupJid, filtered);
-    }
-  }
-}
 
-// NEW: Queue processing system
-async function processMessageQueue(sock) {
-  if (isProcessingQueue || messageQueue.length === 0) return;
-  
-  isProcessingQueue = true;
-  
-  while (messageQueue.length > 0) {
-    const msg = messageQueue.shift();
-    try {
-      await handleMessage(msg, sock);
-    } catch (error) {
-      console.log("⚠️ Queue processing error:", error.message);
-      // Continue with next message
-    }
-    
-    // Small delay to prevent rate limiting
-    if (messageQueue.length > 0) {
-      await new Promise(r => setTimeout(r, 50));
-    }
+  // Flood/rate-limit housekeeping
+  for (const [k, arr] of senderRate.entries()) {
+    const pruned = (arr || []).filter((ts) => (now - ts) < FLOOD_WINDOW_MS);
+    if (pruned.length) senderRate.set(k, pruned);
+    else senderRate.delete(k);
   }
-  
-  isProcessingQueue = false;
+  for (const [k, ts] of floodBanned.entries()) {
+    if ((now - ts) > FLOOD_BAN_TTL_MS) floodBanned.delete(k);
+  }
+  for (const [k, rec] of pendingActions.entries()) {
+    if (!rec || !rec.lastTs) { pendingActions.delete(k); continue; }
+    if ((now - rec.lastTs) > 5 * 60 * 1000) pendingActions.delete(k);
+  }
 }
 
 async function startBot() {
@@ -666,13 +543,12 @@ async function startBot() {
 
         console.log("");
         console.log("╔══════════════════════════════════════════╗");
-        console.log("║ ✅ ANTI-LINK BOT ONLINE (EXTREME MODE)   ║");
+        console.log("║ ✅ ANTI-LINK BOT ONLINE                  ║");
         console.log("╠══════════════════════════════════════════╣");
         console.log("║ 🤖 Bot: " + (BOT_SELF_JID || "unknown").substring(0,30).padEnd(31) + "║");
         console.log("║ 👑 Owner: " + String(ADMIN_NUMBER).padEnd(30) + "║");
-        console.log("║ 📋 Mode: Extreme Anti-Spam              ║");
-        console.log("║ 🚨 Backchecking: Enabled                ║");
-        console.log("║ 💃 We R 🆗 Baby!! 🤫                   ║");
+        console.log("║ 📋 Mode: All groups                      ║");
+        console.log("║ 💃 We R 🆗 Baby!! 🤫                     ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
 
@@ -703,14 +579,14 @@ async function startBot() {
       }
     });
 
-    async function safeDelete(groupJid, msgKey, sock) {
+    async function safeDelete(groupJid, msgKey) {
       const notAdmin = notAdminGroups.get(groupJid);
       if (notAdmin && (Date.now() - notAdmin) < NOT_ADMIN_CACHE_TTL) {
         if (DEBUG_MODE) console.log("⏭️ Skipping - cached as not admin");
         return false;
       }
 
-      const maxAttempts = 2; // Reduced attempts for speed
+      const maxAttempts = 3;
       let delay = 0;
 
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -722,7 +598,7 @@ async function startBot() {
           const errMsg = String(e?.message || e || "");
 
           if (errMsg.includes("rate-overlimit")) {
-            delay = 1000 * attempt; // Shorter delay
+            delay = 2000 * attempt;
             continue;
           }
 
@@ -737,8 +613,9 @@ async function startBot() {
       return false;
     }
 
-    async function safeRemove(groupJid, userJid, sock) {
+    async function safeRemove(groupJid, userJid) {
       try {
+        // SAFEGUARD: never remove owner/self/bot (even if a JID is @lid or device variant)
         if (!userJid) return false;
 
         if (BOT_SELF_JID && String(userJid) === String(BOT_SELF_JID)) {
@@ -746,6 +623,7 @@ async function startBot() {
           return false;
         }
 
+        // If userJid contains a phone-like identity, protect owner/self
         if (jidMatchesNumber(userJid, ADMIN_NUMBER) || (BOT_SELF_PHONE && jidMatchesNumber(userJid, BOT_SELF_PHONE))) {
           console.log("🛡️ Refused to remove owner/self");
           return false;
@@ -760,7 +638,75 @@ async function startBot() {
       }
     }
 
-    async function handleMessage(msg, sock) {
+    function _uniqueDeleteKeys(msgKeys) {
+  const seen = new Set();
+  const out = [];
+  for (const k of (msgKeys || [])) {
+    const id = k?.id || (k?.remoteJid ? (k.remoteJid + ':' + (k.participant || '') + ':' + (k.id || '')) : '');
+    const dedupeKey = id || JSON.stringify(k);
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(k);
+  }
+  return out;
+}
+
+function enqueueBulkViolation(groupJid, senderJid, senderId, msgKey, reasons, strikeCount, options = {}) {
+  const key = groupJid + '-' + senderId;
+  const now = Date.now();
+
+  let rec = pendingActions.get(key);
+  if (!rec) {
+    rec = { groupJid, senderJid, senderId, msgKeys: [], reasons: new Map(), strikeCount: 0, forceRemove: false, timer: null, lastTs: now };
+    pendingActions.set(key, rec);
+  }
+
+  rec.groupJid = groupJid;
+  rec.senderJid = senderJid;
+  rec.senderId = senderId;
+  rec.lastTs = now;
+
+  if (msgKey) rec.msgKeys.push(msgKey);
+  for (const r of (reasons || [])) {
+    rec.reasons.set(r, (rec.reasons.get(r) || 0) + 1);
+  }
+
+  if (typeof strikeCount === 'number') rec.strikeCount = Math.max(rec.strikeCount, strikeCount);
+  if (options.forceRemove) rec.forceRemove = true;
+
+  const delay = (typeof options.delayMs === 'number') ? options.delayMs : BULK_DELAY_MS;
+  if (rec.timer) clearTimeout(rec.timer);
+  rec.timer = setTimeout(() => flushBulkViolation(key).catch(() => {}), delay);
+}
+
+async function flushBulkViolation(key) {
+  const rec = pendingActions.get(key);
+  if (!rec) return;
+  pendingActions.delete(key);
+  if (rec.timer) clearTimeout(rec.timer);
+
+  const keys = _uniqueDeleteKeys(rec.msgKeys);
+  if (DEBUG_MODE) {
+    const reasonsObj = {};
+    for (const [r, c] of rec.reasons.entries()) reasonsObj[r] = c;
+    console.log('🧹 Bulk action:', { key, deleteCount: keys.length, strikeCount: rec.strikeCount, forceRemove: rec.forceRemove, reasons: reasonsObj });
+  }
+
+  for (let i = 0; i < keys.length; i += DELETE_PARALLEL) {
+    const slice = keys.slice(i, i + DELETE_PARALLEL);
+    await Promise.allSettled(slice.map((k) => safeDelete(rec.groupJid, k)));
+  }
+
+  if (rec.forceRemove || rec.strikeCount >= 3) {
+    await new Promise(r => setTimeout(r, 200));
+    const removed = await safeRemove(rec.groupJid, rec.senderJid);
+    if (removed) {
+      const userKey = rec.groupJid + '-' + rec.senderId;
+      userViolations.delete(userKey);
+    }
+  }
+}
+async function handleMessage(msg) {
       try {
         if (!msg?.key?.remoteJid?.endsWith("@g.us")) return;
         if (!msg.message) return;
@@ -770,22 +716,22 @@ async function startBot() {
         const visibleText = extractVisibleText(msg).trim();
         const textLower = visibleText.toLowerCase();
 
-        // Add to history for backchecking
-        addToHistory(groupJid, msg);
-
-        // !bot command
+        // !bot command (keep your preferred format, no version)
         if (textLower === "!bot") {
           console.log("📨 !bot command from:", senderJid);
 
+          // Learn owner's LID if present (fixes cases where your messages come as @lid with fromMe:false)
+          // If OWNER_LID is already set/hardcoded, we keep it.
           if (isLidJid(senderJid) && (!OWNER_LID || OWNER_LID === "")) {
             OWNER_LID = String(senderJid);
             console.log("🔐 Learned OWNER_LID:", OWNER_LID);
+            console.log("ℹ️ Save this in Render env var OWNER_LID to persist across restarts.");
           }
 
           try {
             let responseText = "✅ ANTI-LINK BOT ACTIVE\n";
             responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
-            responseText += "🚨 Mode: Extreme Anti-Spam with Backchecking\n";
+          
             responseText += "💃 We R 🆗 Baby!! 🤫\n";
             await sock.sendMessage(groupJid, { text: responseText });
             console.log("✅ Sent !bot response");
@@ -795,23 +741,79 @@ async function startBot() {
           return;
         }
 
-        // ===== OWNER/SELF EXEMPTION =====
+        // ===== OWNER/SELF EXEMPTION (single source of truth) =====
         const senderPhone = extractPhoneNumber(senderJid);
+        const owner = isOwner(senderJid);
+        const self = isSelfMessage(msg);
+        const exempt = isExempt(msg);
+
+        // HARD OWNER FIREWALL
+        // 1) Phone-based match (normal JIDs)
+        // 2) OWNER_LID match (for @lid senders where fromMe can be false)
         const hardOwner = (
           (senderPhone && (
             normalizeNumber(senderPhone) === normalizeNumber(ADMIN_NUMBER) ||
             (BOT_SELF_PHONE && normalizeNumber(senderPhone) === normalizeNumber(BOT_SELF_PHONE))
           )) ||
-          isOwnerLid(senderJid) ||
-          msg.key.fromMe
+          isOwnerLid(senderJid)
         );
 
-        if (hardOwner) {
-          if (DEBUG_MODE) console.log("👑 Owner/self message - skipping checks");
+        if (DEBUG_MODE) {
+          console.log("🧾 owner-check:", {
+            senderJid,
+            senderPhone,
+            fromMe: !!msg.key.fromMe,
+            admin: ADMIN_NUMBER,
+            botSelfJid: BOT_SELF_JID,
+            botSelfPhone: BOT_SELF_PHONE,
+            owner,
+            ownerLid: isOwnerLid(senderJid),
+            ownerLidValue: OWNER_LID,
+            self,
+            exempt,
+            hardOwner,
+            senderIsLid: isLidJid(senderJid)
+          });
+        }
+
+        // Absolute exemption: if fromMe OR owner/self, do nothing (no violations, no strikes).
+        if (exempt || hardOwner) {
+          if (DEBUG_MODE) console.log("👑 Exempt message - skipping checks");
           return;
         }
 
         // ===== NOT OWNER - CHECK FOR VIOLATIONS =====
+
+
+        // ===== PRIORITY: SENDER-BASED FLOOD BAN (anti-spam) =====
+        // If a sender exceeds FLOOD_MAX_MSG in FLOOD_WINDOW_MS, schedule immediate remove and bulk-delete their spam.
+        const senderId = senderPhone || senderJid;
+        const rateKey = groupJid + '-' + senderId;
+        const now = Date.now();
+
+
+        const bannedAt = floodBanned.get(rateKey);
+        if (bannedAt && (now - bannedAt) < FLOOD_BAN_TTL_MS) {
+          enqueueBulkViolation(groupJid, senderJid, senderId, msg.key, ['flood-ban'], 3, { forceRemove: true, delayMs: 0 });
+          return;
+        }
+
+
+        const arr = senderRate.get(rateKey) || [];
+        const pruned = arr.filter((ts) => (now - ts) < FLOOD_WINDOW_MS);
+        pruned.push(now);
+        senderRate.set(rateKey, pruned);
+
+
+        if (pruned.length > FLOOD_MAX_MSG) {
+          floodBanned.set(rateKey, now);
+          userViolations.set(rateKey, 3);
+          console.log('🚨 FLOOD-BAN: ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
+          enqueueBulkViolation(groupJid, senderJid, senderId, msg.key, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, { forceRemove: true, delayMs: 0 });
+          return;
+        }
+
+
         const dup = checkDuplicate(groupJid, senderJid, visibleText);
         const hasLink = detectLinks(visibleText);
         const hasPhone = detectPhoneNumbers(visibleText);
@@ -823,111 +825,81 @@ async function startBot() {
         const buttons = hasButtons(msg);
         const contact = isContactMessage(msg);
 
-        // EXTREME: Any link is a violation, duplicates are blocked after 1
         const violated = dup.isDuplicate || hasLink || hasPhone || business || apk || zip || audio || keyword || buttons || contact;
-        
-        if (violated) {
-          const reasons = [];
-          if (dup.isDuplicate) reasons.push("duplicate(x" + dup.count + ")");
-          if (dup.isUrlDuplicate) reasons.push("duplicate-url");
-          if (hasLink) reasons.push("link");
-          if (hasPhone) reasons.push("phone");
-          if (business) reasons.push("business");
-          if (apk) reasons.push("apk");
-          if (zip) reasons.push("zip");
-          if (audio) reasons.push("audio");
-          if (keyword) reasons.push("keyword");
-          if (buttons) reasons.push("buttons");
-          if (contact) reasons.push("contact");
+        if (!violated) return;
 
-          const strikeId = senderPhone || senderJid;
-          const userKey = groupJid + "-" + strikeId;
-          const current = userViolations.get(userKey) || 0;
-          const updated = current + 1;
-          userViolations.set(userKey, updated);
+        const reasons = [];
+        if (dup.isDuplicate) reasons.push("duplicate(x" + dup.count + ")");
+        if (hasLink) reasons.push("link");
+        if (hasPhone) reasons.push("phone");
+        if (business) reasons.push("business");
+        if (apk) reasons.push("apk");
+        if (zip) reasons.push("zip");
+        if (audio) reasons.push("audio");
+        if (keyword) reasons.push("keyword");
+        if (buttons) reasons.push("buttons");
+        if (contact) reasons.push("contact");
 
-          console.log("");
-          console.log("🚫 EXTREME VIOLATION DETECTED");
-          console.log("User: " + senderJid);
-          console.log("Group: " + groupJid);
-          console.log("Reason: " + reasons.join(", "));
-          console.log("Strike: " + updated + "/2"); // Reduced to 2 strikes
-          console.log("Text: " + visibleText.substring(0, 100));
+        // Use normalized phone for strike key to avoid device JID variations.
+        // If no phone (e.g. @lid), fall back to senderJid.
+        const strikeId = senderId;
+        const userKey = groupJid + "-" + strikeId;
+        const current = userViolations.get(userKey) || 0;
+        const updated = current + 1;
+        userViolations.set(userKey, updated);
 
-          const deleted = await safeDelete(groupJid, msg.key, sock);
-          if (deleted) {
-            console.log("✅ Message deleted");
-
-            // EXTREME: Remove after 2 strikes instead of 3
-            if (updated >= 2) {
-              console.log("⚠️ 2 strikes - removing user immediately!");
-              
-              // Backcheck for more violations before removing
-              const missedViolations = checkRecentViolations(groupJid, senderJid, sock);
-              if (missedViolations > 0) {
-                console.log(`🔍 Found ${missedViolations} additional violations in backcheck`);
-              }
-              
-              await new Promise(r => setTimeout(r, 300));
-              const removed = await safeRemove(groupJid, senderJid, sock);
-              if (removed) {
-                userViolations.delete(userKey);
-                console.log("✅ User removed from group");
-              }
-            }
-          }
-          console.log("");
-        } else if (hasLink) {
-          // Even if not a duplicate, track link senders
-          const strikeId = senderPhone || senderJid;
-          const userKey = groupJid + "-" + strikeId;
-          const current = userViolations.get(userKey) || 0;
-          
-          if (current > 0) {
-            console.log(`⚠️ User ${senderJid} sent a link (strike ${current})`);
-          }
-        }
+        console.log("");
+        console.log("🚫 VIOLATION DETECTED");
+        console.log("User: " + senderJid);
+        console.log("Group: " + groupJid);
+        console.log("Reason: " + reasons.join(", "));
+        console.log("Strike: " + updated + "/3");
+        console.log("Text: " + visibleText.substring(0, 100));
+        // Bulk delete + single removal flush (reduces API calls during coordinated spam)
+        enqueueBulkViolation(groupJid, senderJid, strikeId, msg.key, reasons, updated, { forceRemove: updated >= 3 });
+        console.log("");
       } catch (e) {
-        console.log("⚠️ Error in handleMessage:", e?.message);
+        console.log("⚠️ Error:", e?.message);
       }
     }
 
-    // Main message handler with queue
-    sock.ev.on("messages.upsert", async (m) => {
-      const messages = m.messages || [];
-      
-      if (messages.length > 5) {
-        console.log(`🚨 Rapid-fire detected: ${messages.length} messages at once`);
-      }
-      
-      // Add all messages to queue
-      for (const msg of messages) {
-        if (!msg?.key?.remoteJid?.endsWith("@g.us")) continue;
-        if (!msg.message) continue;
-        
-        // Limit queue size
-        if (messageQueue.length < MAX_QUEUE_SIZE) {
-          messageQueue.push(msg);
-        } else {
-          console.log("⚠️ Queue full, dropping message");
-        }
-      }
-      
-      // Start processing queue
-      processMessageQueue(sock).catch(() => {});
-    });
+    function enqueueIncomingMessages(msgs) {
+  for (const msg of (msgs || [])) {
+    if (!msg?.key?.remoteJid?.endsWith('@g.us')) continue;
+    if (!msg.message) continue;
+    incomingQueue.push(msg);
+  }
+  if (!drainingQueue) {
+    drainingQueue = true;
+    const sched = (typeof setImmediate === 'function') ? setImmediate : (fn) => setTimeout(fn, 0);
+    sched(drainIncomingQueue);
+  }
+}
 
-    // Periodic cleanup
+async function drainIncomingQueue() {
+  try {
+    while (incomingQueue.length) {
+      const batch = incomingQueue.splice(0, QUEUE_BATCH_SIZE);
+      for (let i = 0; i < batch.length; i += QUEUE_PARALLEL) {
+        const slice = batch.slice(i, i + QUEUE_PARALLEL);
+        await Promise.allSettled(slice.map((msg) => handleMessage(msg)));
+      }
+    }
+  } finally {
+    drainingQueue = false;
+    if (incomingQueue.length) {
+      drainingQueue = true;
+      setTimeout(drainIncomingQueue, 0);
+    }
+  }
+}
+
+sock.ev.on('messages.upsert', (m) => {
+  enqueueIncomingMessages(m.messages || []);
+});
+
     setInterval(cleanupCaches, 30000);
-    
-    // Also trigger backchecking periodically for busy groups
-    setInterval(() => {
-      if (DEBUG_MODE) {
-        console.log(`📊 Stats: Queue=${messageQueue.length}, History groups=${messageHistory.size}`);
-      }
-    }, 60000);
-
-    console.log("🚀 Bot initialized (Extreme Mode) - waiting for connection...");
+    console.log("🚀 Bot initialized - waiting for connection...");
 
   } catch (e) {
     console.log("❌ Start error:", e.message);
