@@ -35,6 +35,25 @@ const recentMessages = new Map();
 const DUP_WINDOW_MS = 30000;
 const DUP_BLOCK_FROM = 2;
 
+// ===== Flood & throughput hardening (anti-coordinated spam) =====
+// 1) Sender-based flood ban: if a sender posts more than FLOOD_MAX_MSG in FLOOD_WINDOW_MS => queued immediate remove
+const senderRate = new Map();
+const floodBanned = new Map();
+const FLOOD_WINDOW_MS = 3000;
+const FLOOD_MAX_MSG = 5;
+const FLOOD_BAN_TTL_MS = 60000;
+
+// 3) Bulk moderation: buffer deletes/removal per sender to reduce API churn under flood
+const pendingActions = new Map();
+const BULK_DELAY_MS = 600;
+const DELETE_PARALLEL = 6;
+
+// 2) Optimized queue processing: drain in parallel batches with a hard concurrency limit
+const incomingQueue = [];
+let drainingQueue = false;
+const QUEUE_BATCH_SIZE = 25;
+const QUEUE_PARALLEL = 8;
+
 let hasConnectedBefore = false;
 
 // Deterministic: we learn the bot's own JID once connected
@@ -244,15 +263,12 @@ function isExempt(msg) {
   return false;
 }
 
+// Fast path: single precompiled regex for speed during heavy load
+const FAST_LINK_REGEX = /(?:https?:\/\/|www\.)\S+|\b(?:wa\.me|whatsapp\.com)\/\S+|\b[A-Za-z0-9-]{1,63}\.(?:com|net|org|io|co|me|app|tech|info|biz|store|online|ly|ge|ke|uk|us|tv|gg|site|blog|news|vip|link)(?:\/\S*)?\b/i;
+
 function detectLinks(text) {
   if (!text) return false;
-  const patterns = [
-    /https?:\/\/[^\s]+/i,
-    /www\.[^\s]+/i,
-    /\b(?:wa\.me|whatsapp\.com)\/\S+/i,
-    /\b[A-Za-z0-9-]+\.(?:com|net|org|io|co|me|app|tech|info|biz|store|online|ly|ge|ke|uk|us|tv|gg|site|blog|news)(?:\/\S*)?\b/i,
-  ];
-  return patterns.some((r) => r.test(text));
+  return FAST_LINK_REGEX.test(text);
 }
 
 function detectPhoneNumbers(text) {
@@ -444,6 +460,20 @@ function cleanupCaches() {
   for (const [k, v] of notAdminGroups.entries()) {
     if ((now - v) > NOT_ADMIN_CACHE_TTL) notAdminGroups.delete(k);
   }
+
+  // Flood/rate-limit housekeeping
+  for (const [k, arr] of senderRate.entries()) {
+    const pruned = (arr || []).filter((ts) => (now - ts) < FLOOD_WINDOW_MS);
+    if (pruned.length) senderRate.set(k, pruned);
+    else senderRate.delete(k);
+  }
+  for (const [k, ts] of floodBanned.entries()) {
+    if ((now - ts) > FLOOD_BAN_TTL_MS) floodBanned.delete(k);
+  }
+  for (const [k, rec] of pendingActions.entries()) {
+    if (!rec || !rec.lastTs) { pendingActions.delete(k); continue; }
+    if ((now - rec.lastTs) > 5 * 60 * 1000) pendingActions.delete(k);
+  }
 }
 
 async function startBot() {
@@ -608,7 +638,75 @@ async function startBot() {
       }
     }
 
-    async function handleMessage(msg) {
+    function _uniqueDeleteKeys(msgKeys) {
+  const seen = new Set();
+  const out = [];
+  for (const k of (msgKeys || [])) {
+    const id = k?.id || (k?.remoteJid ? (k.remoteJid + ':' + (k.participant || '') + ':' + (k.id || '')) : '');
+    const dedupeKey = id || JSON.stringify(k);
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(k);
+  }
+  return out;
+}
+
+function enqueueBulkViolation(groupJid, senderJid, senderId, msgKey, reasons, strikeCount, options = {}) {
+  const key = groupJid + '-' + senderId;
+  const now = Date.now();
+
+  let rec = pendingActions.get(key);
+  if (!rec) {
+    rec = { groupJid, senderJid, senderId, msgKeys: [], reasons: new Map(), strikeCount: 0, forceRemove: false, timer: null, lastTs: now };
+    pendingActions.set(key, rec);
+  }
+
+  rec.groupJid = groupJid;
+  rec.senderJid = senderJid;
+  rec.senderId = senderId;
+  rec.lastTs = now;
+
+  if (msgKey) rec.msgKeys.push(msgKey);
+  for (const r of (reasons || [])) {
+    rec.reasons.set(r, (rec.reasons.get(r) || 0) + 1);
+  }
+
+  if (typeof strikeCount === 'number') rec.strikeCount = Math.max(rec.strikeCount, strikeCount);
+  if (options.forceRemove) rec.forceRemove = true;
+
+  const delay = (typeof options.delayMs === 'number') ? options.delayMs : BULK_DELAY_MS;
+  if (rec.timer) clearTimeout(rec.timer);
+  rec.timer = setTimeout(() => flushBulkViolation(key).catch(() => {}), delay);
+}
+
+async function flushBulkViolation(key) {
+  const rec = pendingActions.get(key);
+  if (!rec) return;
+  pendingActions.delete(key);
+  if (rec.timer) clearTimeout(rec.timer);
+
+  const keys = _uniqueDeleteKeys(rec.msgKeys);
+  if (DEBUG_MODE) {
+    const reasonsObj = {};
+    for (const [r, c] of rec.reasons.entries()) reasonsObj[r] = c;
+    console.log('🧹 Bulk action:', { key, deleteCount: keys.length, strikeCount: rec.strikeCount, forceRemove: rec.forceRemove, reasons: reasonsObj });
+  }
+
+  for (let i = 0; i < keys.length; i += DELETE_PARALLEL) {
+    const slice = keys.slice(i, i + DELETE_PARALLEL);
+    await Promise.allSettled(slice.map((k) => safeDelete(rec.groupJid, k)));
+  }
+
+  if (rec.forceRemove || rec.strikeCount >= 3) {
+    await new Promise(r => setTimeout(r, 200));
+    const removed = await safeRemove(rec.groupJid, rec.senderJid);
+    if (removed) {
+      const userKey = rec.groupJid + '-' + rec.senderId;
+      userViolations.delete(userKey);
+    }
+  }
+}
+async function handleMessage(msg) {
       try {
         if (!msg?.key?.remoteJid?.endsWith("@g.us")) return;
         if (!msg.message) return;
@@ -685,6 +783,37 @@ async function startBot() {
         }
 
         // ===== NOT OWNER - CHECK FOR VIOLATIONS =====
+
+
+        // ===== PRIORITY: SENDER-BASED FLOOD BAN (anti-spam) =====
+        // If a sender exceeds FLOOD_MAX_MSG in FLOOD_WINDOW_MS, schedule immediate remove and bulk-delete their spam.
+        const senderId = senderPhone || senderJid;
+        const rateKey = groupJid + '-' + senderId;
+        const now = Date.now();
+
+
+        const bannedAt = floodBanned.get(rateKey);
+        if (bannedAt && (now - bannedAt) < FLOOD_BAN_TTL_MS) {
+          enqueueBulkViolation(groupJid, senderJid, senderId, msg.key, ['flood-ban'], 3, { forceRemove: true, delayMs: 0 });
+          return;
+        }
+
+
+        const arr = senderRate.get(rateKey) || [];
+        const pruned = arr.filter((ts) => (now - ts) < FLOOD_WINDOW_MS);
+        pruned.push(now);
+        senderRate.set(rateKey, pruned);
+
+
+        if (pruned.length > FLOOD_MAX_MSG) {
+          floodBanned.set(rateKey, now);
+          userViolations.set(rateKey, 3);
+          console.log('🚨 FLOOD-BAN: ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
+          enqueueBulkViolation(groupJid, senderJid, senderId, msg.key, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, { forceRemove: true, delayMs: 0 });
+          return;
+        }
+
+
         const dup = checkDuplicate(groupJid, senderJid, visibleText);
         const hasLink = detectLinks(visibleText);
         const hasPhone = detectPhoneNumbers(visibleText);
@@ -713,7 +842,7 @@ async function startBot() {
 
         // Use normalized phone for strike key to avoid device JID variations.
         // If no phone (e.g. @lid), fall back to senderJid.
-        const strikeId = senderPhone || senderJid;
+        const strikeId = senderId;
         const userKey = groupJid + "-" + strikeId;
         const current = userViolations.get(userKey) || 0;
         const updated = current + 1;
@@ -726,34 +855,48 @@ async function startBot() {
         console.log("Reason: " + reasons.join(", "));
         console.log("Strike: " + updated + "/3");
         console.log("Text: " + visibleText.substring(0, 100));
-
-        const deleted = await safeDelete(groupJid, msg.key);
-        if (deleted) {
-          console.log("✅ Message deleted");
-
-          if (updated >= 3) {
-            console.log("⚠️ 3 strikes - removing user...");
-            await new Promise(r => setTimeout(r, 500));
-            const removed = await safeRemove(groupJid, senderJid);
-            if (removed) {
-              userViolations.delete(userKey);
-            }
-          }
-        }
+        // Bulk delete + single removal flush (reduces API calls during coordinated spam)
+        enqueueBulkViolation(groupJid, senderJid, strikeId, msg.key, reasons, updated, { forceRemove: updated >= 3 });
         console.log("");
       } catch (e) {
         console.log("⚠️ Error:", e?.message);
       }
     }
 
-    sock.ev.on("messages.upsert", async (m) => {
-      const messages = m.messages || [];
-      for (const msg of messages) {
-        if (!msg?.key?.remoteJid?.endsWith("@g.us")) continue;
-        if (!msg.message) continue;
-        handleMessage(msg).catch(() => {});
+    function enqueueIncomingMessages(msgs) {
+  for (const msg of (msgs || [])) {
+    if (!msg?.key?.remoteJid?.endsWith('@g.us')) continue;
+    if (!msg.message) continue;
+    incomingQueue.push(msg);
+  }
+  if (!drainingQueue) {
+    drainingQueue = true;
+    const sched = (typeof setImmediate === 'function') ? setImmediate : (fn) => setTimeout(fn, 0);
+    sched(drainIncomingQueue);
+  }
+}
+
+async function drainIncomingQueue() {
+  try {
+    while (incomingQueue.length) {
+      const batch = incomingQueue.splice(0, QUEUE_BATCH_SIZE);
+      for (let i = 0; i < batch.length; i += QUEUE_PARALLEL) {
+        const slice = batch.slice(i, i + QUEUE_PARALLEL);
+        await Promise.allSettled(slice.map((msg) => handleMessage(msg)));
       }
-    });
+    }
+  } finally {
+    drainingQueue = false;
+    if (incomingQueue.length) {
+      drainingQueue = true;
+      setTimeout(drainIncomingQueue, 0);
+    }
+  }
+}
+
+sock.ev.on('messages.upsert', (m) => {
+  enqueueIncomingMessages(m.messages || []);
+});
 
     setInterval(cleanupCaches, 30000);
     console.log("🚀 Bot initialized - waiting for connection...");
