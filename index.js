@@ -136,6 +136,8 @@ function restoreSessionFromEnv() {
     const decrypted = decrypt(encrypted);
     if (!decrypted) {
       console.log("❌ Failed to decrypt session");
+      console.log("🧩 Likely causes: (1) WHATSAPP_SESSION value is truncated/corrupted, or (2) SESSION_KEY changed since session was generated.");
+      console.log("✅ Fix: restore the original SESSION_KEY, OR delete WHATSAPP_SESSION env var to force a fresh pairing, then redeploy.");
       return false;
     }
 
@@ -606,12 +608,12 @@ async function startBot() {
       msgRetryCounterCache: new Map(),
     });
 
-    if (!state.creds.registered) {
-      console.log("");
-      console.log("📱 Requesting pairing code for: " + ADMIN_NUMBER);
-      console.log("⏳ Please wait...");
-      await new Promise(r => setTimeout(r, 3000));
+    async function requestPairingWithRetry() {
       try {
+        console.log("");
+        console.log("📱 Requesting pairing code for: " + ADMIN_NUMBER);
+        console.log("⏳ Please wait...");
+        await new Promise(r => setTimeout(r, 3000));
         const code = await sock.requestPairingCode(ADMIN_NUMBER);
         console.log("");
         console.log("╔════════════════════════════════════════╗");
@@ -627,13 +629,24 @@ async function startBot() {
         console.log("║ 4. Enter the 8-digit code above        ║");
         console.log("╚════════════════════════════════════════╝");
         console.log("");
+        return true;
       } catch (e) {
         console.log("⚠️ Pairing code error:", e?.message);
-        console.log("🔄 Will retry in 10 seconds...");
+        return false;
       }
+    }    if (!state.creds.registered) {
+      // If session restore failed or this is a fresh deploy, request pairing code.
+      // Retry a few times in case Render/network is flaky on first boot.
+      (async () => {
+        for (let i = 0; i < 5; i++) {
+          const ok = await requestPairingWithRetry();
+          if (ok) break;
+          console.log('🔄 Will retry pairing code in 10 seconds...');
+          await new Promise(r => setTimeout(r, 10000));
+        }
+      })().catch(() => {});
     }
-
-    sock.ev.on("creds.update", async () => {
+sock.ev.on("creds.update", async () => {
       await saveCreds();
       saveSessionToEnv();
     });
