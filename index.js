@@ -111,15 +111,48 @@ function encrypt(text) {
 
 function decrypt(text) {
   try {
-    const parts = text.split(":");
-    const iv = Buffer.from(parts.shift(), "hex");
-    const encryptedText = parts.join(":");
-    const decipher = crypto.createDecipheriv("aes-256-cbc", getEncryptionKey(), iv);
-    let decrypted = decipher.update(encryptedText, "hex", "utf8");
-    decrypted += decipher.final("utf8");
+    // Render sometimes stores env vars with accidental whitespace/newlines or surrounding quotes.
+    // Strip them so we don't end up passing invalid hex into Buffer/crypto.
+    let raw = String(text || '');
+    raw = raw.trim();
+    raw = raw.replace(/^['"]|['"]$/g, '');
+    raw = raw.replace(/\s+/g, '');
+    // Extra hardening: strip any accidental characters so Buffer/crypto never sees non-hex
+    raw = raw.replace(/[^0-9a-fA-F:]/g, '');
+
+    if (!raw || !raw.includes(':')) {
+      if (raw) console.log('Decryption error: WHATSAPP_SESSION missing ':' separator');
+      return null;
+    }
+
+    const parts = raw.split(':');
+    const ivHex = String(parts.shift() || '');
+    const encryptedHex = String(parts.join(':') || '');
+
+    if (ivHex.length !== 32 || !/^[0-9a-fA-F]+$/.test(ivHex)) {
+      console.log('Decryption error: invalid IV hex (expected 32 hex chars). Got length=' + ivHex.length);
+      return null;
+    }
+    if (!encryptedHex) {
+      console.log('Decryption error: missing ciphertext');
+      return null;
+    }
+    if ((encryptedHex.length % 2) !== 0) {
+      console.log('Decryption error: ciphertext hex length is odd (truncated env var). Length=' + encryptedHex.length);
+      return null;
+    }
+    if (!/^[0-9a-fA-F]+$/.test(encryptedHex)) {
+      console.log('Decryption error: ciphertext contains non-hex characters');
+      return null;
+    }
+
+    const iv = Buffer.from(ivHex, 'hex');
+    const decipher = crypto.createDecipheriv('aes-256-cbc', getEncryptionKey(), iv);
+    let decrypted = decipher.update(encryptedHex, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
     return decrypted;
   } catch (error) {
-    console.log("Decryption error:", error.message);
+    console.log('Decryption error:', error.message);
     return null;
   }
 }
@@ -212,20 +245,14 @@ function extractPhoneNumber(jid) {
 }
 
 function jidMatchesNumber(senderJid, phoneDigits) {
+  // STRICT match to prevent false exemptions/removals.
+  // We only compare normalized digit identities extracted from the JID.
+  // This still supports device-variant JIDs because extractPhoneNumber() drops ':device' parts.
   if (!senderJid || !phoneDigits) return false;
-  const sj = String(senderJid);
   const digits = extractPhoneNumber(senderJid);
   const target = normalizeNumber(phoneDigits);
-  if (!target) return false;
-
-  if (digits === target) return true;
-  if (sj.includes(target)) return true;
-
-  if (digits.length >= 9 && target.length >= 9) {
-    if (digits.slice(-9) === target.slice(-9)) return true;
-  }
-
-  return false;
+  if (!digits || !target) return false;
+  return digits === target;
 }
 
 function isOwner(senderJid) {
