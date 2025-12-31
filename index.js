@@ -1,4 +1,4 @@
-// Anti-Link Bot v2.9.3 (Re-add resilient) - Deterministic Owner Exempt + Session Persistence
+// Anti-Link Bot v2.9.3 (Re-add resilient) - Deterministic Owner Exempt + Session Persistence + Diagnostics
 
 const {
   default: makeWASocket,
@@ -25,7 +25,7 @@ http.createServer((req, res) => {
   res.end("Anti-Link Bot Running");
 }).listen(PORT, () => console.log("Health server on port " + PORT));
 
-console.log("🔧 Build: 2025-12-31 (readd-fix + decrypt-harden + safe-regexp)");
+console.log("🔧 Build: 2025-12-31 (readd-fix + decrypt-harden + safe-regexp + diag-logs)");
 
 // IMPORTANT CHANGE:
 // Track strikes by normalized phone (not raw JID) so device-variants don't create new strike buckets.
@@ -93,6 +93,36 @@ const createSilentLogger = () => {
   };
 };
 
+function _ts() {
+  return new Date().toISOString();
+}
+
+function _snip(s, n = 140) {
+  const t = String(s || "");
+  if (t.length <= n) return t;
+  return t.slice(0, n) + "…";
+}
+
+function _msgKeyInfo(msgKey) {
+  try {
+    const k = msgKey || {};
+    return {
+      id: k.id,
+      fromMe: !!k.fromMe,
+      remoteJid: k.remoteJid,
+      participant: k.participant,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function _looksLinkish(text) {
+  const s = String(text || "");
+  if (!s) return false;
+  return /(https?:|www\.|wa\.me|whatsapp\.com|\.[a-z]{2,}(?:\b|\/))/i.test(s);
+}
+
 function getEncryptionKey() {
   const key = process.env.SESSION_KEY || "AntiLinkBotDefaultKey2024SecureX";
   return crypto.createHash("sha256").update(key).digest();
@@ -116,7 +146,7 @@ function decrypt(text) {
   try {
     let raw = String(text || "");
     raw = raw.trim();
-    raw = raw.replace(/^['"]|['"]$/g, "");
+    raw = raw.replace(/^['\"]|['\"]$/g, "");
     raw = raw.replace(/\s+/g, "");
     raw = raw.replace(/[^0-9a-fA-F:]/g, "");
 
@@ -670,7 +700,7 @@ async function drainDeleteRetryQueue(safeDelete) {
   const PAR = Math.max(1, Math.floor(DELETE_PARALLEL / 2));
   for (let i = 0; i < ready.length; i += PAR) {
     const slice = ready.slice(i, i + PAR);
-    const results = await Promise.allSettled(slice.map((it) => safeDelete(it.groupJid, it.msgKey)));
+    const results = await Promise.allSettled(slice.map((it) => safeDelete(it.groupJid, it.msgKey, { source: "retry", attempt: it.attempt } )));
     results.forEach((r, idx) => {
       const it = slice[idx];
       const ok = (r.status === 'fulfilled') && r.value === true;
@@ -691,7 +721,7 @@ function enqueueBulkViolation(groupJid, senderJid, senderId, msgKeyOrKeys, reaso
 
   let rec = pendingActions.get(key);
   if (!rec) {
-    rec = { groupJid, senderJid, senderId, msgKeys: [], reasons: new Map(), strikeCount: 0, forceRemove: false, timer: null, dueTs: 0, lastTs: now };
+    rec = { groupJid, senderJid, senderId, msgKeys: [], reasons: new Map(), strikeCount: 0, forceRemove: false, timer: null, dueTs: 0, firstTs: now, lastTs: now, sampleText: "" };
     pendingActions.set(key, rec);
   }
 
@@ -699,6 +729,8 @@ function enqueueBulkViolation(groupJid, senderJid, senderId, msgKeyOrKeys, reaso
   rec.senderJid = senderJid;
   rec.senderId = senderId;
   rec.lastTs = now;
+
+  if (options.sampleText && !rec.sampleText) rec.sampleText = String(options.sampleText);
 
   const keys = Array.isArray(msgKeyOrKeys) ? msgKeyOrKeys : (msgKeyOrKeys ? [msgKeyOrKeys] : []);
   if (keys.length) rec.msgKeys.push(...keys);
@@ -723,9 +755,24 @@ function enqueueBulkViolation(groupJid, senderJid, senderId, msgKeyOrKeys, reaso
       rec.timer = setTimeout(() => flushBulkViolation(key).catch(() => {}), Math.max(0, rec.dueTs - Date.now()));
     }
   }
-}
 
-let sockRef = null;
+  if (DEBUG_MODE && options.debugTag) {
+    console.log("📌 enqueueBulkViolation", {
+      ts: _ts(),
+      debugTag: options.debugTag,
+      key,
+      senderJid,
+      senderId,
+      groupJid,
+      reasons,
+      strikeCount,
+      forceRemove: !!options.forceRemove,
+      delayMs: delay,
+      dueInMs: Math.max(0, due - Date.now()),
+      sample: _snip(rec.sampleText || options.sampleText || "")
+    });
+  }
+}
 
 async function flushBulkViolation(key) {
   const rec = pendingActions.get(key);
@@ -736,24 +783,55 @@ async function flushBulkViolation(key) {
   rec.dueTs = 0;
 
   const keys = _uniqueDeleteKeys(rec.msgKeys);
-  if (DEBUG_MODE) {
-    const reasonsObj = {};
-    for (const [r, c] of rec.reasons.entries()) reasonsObj[r] = c;
-    console.log('🧹 Bulk action:', { key, deleteCount: keys.length, strikeCount: rec.strikeCount, forceRemove: rec.forceRemove, reasons: reasonsObj });
-  }
 
   const safeDelete = sockRef?._safeDelete;
   const safeRemove = sockRef?._safeRemove;
 
+  if (DEBUG_MODE) {
+    const reasonsObj = {};
+    for (const [r, c] of rec.reasons.entries()) reasonsObj[r] = c;
+    console.log('🧹 Bulk action start:', {
+      ts: _ts(),
+      key,
+      groupJid: rec.groupJid,
+      senderJid: rec.senderJid,
+      senderId: rec.senderId,
+      deleteCount: keys.length,
+      strikeCount: rec.strikeCount,
+      forceRemove: rec.forceRemove,
+      reasons: reasonsObj,
+      ageMs: Date.now() - (rec.firstTs || Date.now()),
+      sample: _snip(rec.sampleText)
+    });
+  }
+
+  let okCount = 0;
+  let failCount = 0;
+
   if (typeof safeDelete === 'function') {
     for (let i = 0; i < keys.length; i += DELETE_PARALLEL) {
       const slice = keys.slice(i, i + DELETE_PARALLEL);
-      const results = await Promise.allSettled(slice.map((k) => safeDelete(rec.groupJid, k)));
+      const results = await Promise.allSettled(slice.map((k) => safeDelete(rec.groupJid, k, { source: "bulk" })));
       results.forEach((r, idx) => {
         const ok = (r.status === 'fulfilled') && r.value === true;
-        if (!ok) enqueueDeleteRetry(rec.groupJid, slice[idx], 1);
+        if (ok) okCount += 1;
+        else {
+          failCount += 1;
+          enqueueDeleteRetry(rec.groupJid, slice[idx], 1);
+        }
       });
     }
+  }
+
+  if (DEBUG_MODE) {
+    console.log('🧹 Bulk action delete summary:', {
+      ts: _ts(),
+      key,
+      ok: okCount,
+      failed: failCount,
+      retryQueueLen: deleteRetryQueue.length,
+      notAdminCached: notAdminGroups.has(rec.groupJid)
+    });
   }
 
   if (deleteRetryQueue.length && !deleteRetryTimer && typeof safeDelete === 'function') {
@@ -763,6 +841,17 @@ async function flushBulkViolation(key) {
   if ((rec.forceRemove || rec.strikeCount >= 3) && typeof safeRemove === 'function') {
     await new Promise(r => setTimeout(r, 200));
     const removed = await safeRemove(rec.groupJid, rec.senderJid);
+
+    if (DEBUG_MODE) {
+      console.log('👢 Remove attempt:', {
+        ts: _ts(),
+        key,
+        groupJid: rec.groupJid,
+        senderJid: rec.senderJid,
+        removed: !!removed
+      });
+    }
+
     if (removed) {
       const userKey = rec.groupJid + '-' + rec.senderId;
       userViolations.delete(userKey);
@@ -848,7 +937,7 @@ async function startBot() {
         console.log("║ 👑 Owner: " + String(ADMIN_NUMBER).padEnd(30) + "║");
         console.log("║ 📋 Mode: All groups                      ║");
         console.log("║ 🚀 Hi/Lo queue + bulk moderation         ║");
-        console.log("║ 🛡️ Re-add resilient deletes             ║");
+        console.log("║ 🧾 Diagnostic logs enabled               ║");
         console.log("╚══════════════════════════════════════════╝");
         console.log("");
 
@@ -857,6 +946,7 @@ async function startBot() {
           console.log("- ADMIN_NUMBER: " + ADMIN_NUMBER);
           console.log("- BOT_SELF_JID: " + BOT_SELF_JID);
           console.log("- BOT_SELF_PHONE: " + BOT_SELF_PHONE);
+          console.log("- OWNER_LID: " + OWNER_LID);
         }
 
         saveSessionToEnv();
@@ -879,7 +969,9 @@ async function startBot() {
       }
     });
 
-    async function safeDelete(groupJid, msgKey) {
+    async function safeDelete(groupJid, msgKey, meta = {}) {
+      const keyInfo = _msgKeyInfo(msgKey);
+
       const cachedAt = notAdminGroups.get(groupJid);
       if (cachedAt) {
         const now = Date.now();
@@ -890,12 +982,22 @@ async function startBot() {
         const lastProbe = safeDelete._lastProbeAt.get(groupJid) || 0;
 
         if (age < NOT_ADMIN_CACHE_TTL && (now - lastProbe) < PROBE_EVERY_MS) {
-          if (DEBUG_MODE) console.log("⏭️ Skipping - cached as not admin (age " + age + "ms)");
+          if (DEBUG_MODE) {
+            console.log("🧱 delete skipped (cached not-admin)", {
+              ts: _ts(),
+              groupJid,
+              ageMs: age,
+              probeEveryMs: PROBE_EVERY_MS,
+              lastProbeMsAgo: now - lastProbe,
+              meta,
+              msgKey: keyInfo,
+            });
+          }
           return false;
         }
 
         safeDelete._lastProbeAt.set(groupJid, now);
-        if (DEBUG_MODE) console.log("🔁 Re-probing delete despite notAdmin cache (age " + age + "ms)");
+        if (DEBUG_MODE) console.log("🔁 delete re-probe despite notAdmin cache", { ts: _ts(), groupJid, ageMs: age, meta, msgKey: keyInfo });
       }
 
       const maxAttempts = 3;
@@ -904,12 +1006,26 @@ async function startBot() {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         if (delay) await new Promise(r => setTimeout(r, delay));
         try {
+          if (DEBUG_MODE) console.log("🗑️ delete attempt", { ts: _ts(), groupJid, attempt, meta, msgKey: keyInfo });
           await sock.sendMessage(groupJid, { delete: msgKey });
           if (notAdminGroups.has(groupJid)) notAdminGroups.delete(groupJid);
+          if (DEBUG_MODE) console.log("✅ delete ok", { ts: _ts(), groupJid, meta, msgKey: keyInfo });
           return true;
         } catch (e) {
           const errMsg = String(e?.message || e || "");
           const statusCode = e?.output?.statusCode || e?.statusCode || e?.status;
+
+          if (DEBUG_MODE) {
+            console.log("❌ delete failed", {
+              ts: _ts(),
+              groupJid,
+              attempt,
+              statusCode,
+              errMsg: _snip(errMsg, 220),
+              meta,
+              msgKey: keyInfo,
+            });
+          }
 
           if (errMsg.includes("rate-overlimit")) {
             delay = 2000 * attempt;
@@ -924,6 +1040,8 @@ async function startBot() {
           break;
         }
       }
+
+      if (DEBUG_MODE) console.log("❌ delete gave up", { ts: _ts(), groupJid, meta, msgKey: keyInfo, notAdminCached: notAdminGroups.has(groupJid) });
       return false;
     }
 
@@ -1018,20 +1136,36 @@ async function startBot() {
           return;
         }
 
-        try {
-          const earlyLink = detectLinks(visibleText);
-          if (earlyLink) {
-            const senderId0 = senderPhone || senderJid || ('unknown-' + (msg.key?.id || Date.now()));
-            const rateKey0 = groupJid + '-' + senderId0;
-            rememberSenderKey(rateKey0, msg.key);
-            const userKey0 = groupJid + '-' + senderId0;
-            const current0 = userViolations.get(userKey0) || 0;
-            const updated0 = current0 + 1;
-            userViolations.set(userKey0, updated0);
-            enqueueBulkViolation(groupJid, senderJid || (msg.key?.participant || ''), senderId0, msg.key, ['link'], updated0, { forceRemove: updated0 >= 3 });
-            return;
-          }
-        } catch {}
+        const earlyLink = detectLinks(visibleText);
+        const linkish = _looksLinkish(visibleText);
+
+        if (DEBUG_MODE && linkish && !earlyLink) {
+          console.log("⚠️ linkish-but-not-detected", {
+            ts: _ts(),
+            senderJid,
+            groupJid,
+            text: _snip(visibleText, 220)
+          });
+        }
+
+        if (earlyLink) {
+          const senderId0 = senderPhone || senderJid || ('unknown-' + (msg.key?.id || Date.now()));
+          const rateKey0 = groupJid + '-' + senderId0;
+          rememberSenderKey(rateKey0, msg.key);
+
+          const userKey0 = groupJid + '-' + senderId0;
+          const current0 = userViolations.get(userKey0) || 0;
+          const updated0 = current0 + 1;
+          userViolations.set(userKey0, updated0);
+
+          enqueueBulkViolation(groupJid, senderJid || (msg.key?.participant || ''), senderId0, msg.key, ['link'], updated0, {
+            forceRemove: updated0 >= 3,
+            delayMs: 0,
+            debugTag: "earlyLink",
+            sampleText: _snip(visibleText, 220)
+          });
+          return;
+        }
 
         const senderId = senderPhone || senderJid || ('unknown-' + (msg.key?.id || Date.now()));
         const rateKey = groupJid + '-' + senderId;
@@ -1042,7 +1176,12 @@ async function startBot() {
         const bannedAt = floodBanned.get(rateKey);
         if (bannedAt && (now - bannedAt) < FLOOD_BAN_TTL_MS) {
           const backKeys = getRecentSenderKeys(rateKey);
-          enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood-ban'], 3, { forceRemove: true, delayMs: 0 });
+          enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood-ban'], 3, {
+            forceRemove: true,
+            delayMs: 0,
+            debugTag: "floodBan-active",
+            sampleText: _snip(visibleText, 220)
+          });
           return;
         }
 
@@ -1055,12 +1194,17 @@ async function startBot() {
           userViolations.set(rateKey, 3);
           console.log('🚨 FLOOD-BAN: ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
           const backKeys = getRecentSenderKeys(rateKey);
-          enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, { forceRemove: true, delayMs: 0 });
+          enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, {
+            forceRemove: true,
+            delayMs: 0,
+            debugTag: "floodBan-trip",
+            sampleText: _snip(visibleText, 220)
+          });
           return;
         }
 
         const dup = checkDuplicate(groupJid, senderJid, visibleText);
-        const hasLink = detectLinks(visibleText);
+        const hasLink = false;
         const hasPhone = detectPhoneNumbers(visibleText);
         const business = isBusinessPost(msg0);
         const apk = isAPKFile(msg0);
@@ -1071,6 +1215,33 @@ async function startBot() {
         const contact = isContactMessage(msg0);
 
         const violated = dup.isDuplicate || hasLink || hasPhone || business || apk || zip || audio || keyword || buttons || contact;
+
+        if (DEBUG_MODE) {
+          const shouldLogEval = linkish || hasPhone || keyword || buttons || contact || apk || zip || audio || business;
+          if (shouldLogEval) {
+            console.log("🧪 eval", {
+              ts: _ts(),
+              groupJid,
+              senderJid,
+              senderId,
+              textLen: visibleText.length,
+              linkish,
+              detectedLink: earlyLink,
+              dup: dup.isDuplicate ? dup.count : 0,
+              phone: hasPhone,
+              business,
+              apk,
+              zip,
+              audio,
+              keyword,
+              buttons,
+              contact,
+              violated,
+              text: _snip(visibleText, 220)
+            });
+          }
+        }
+
         if (!violated) return;
 
         const reasons = [];
@@ -1096,9 +1267,14 @@ async function startBot() {
         console.log("Group: " + groupJid);
         console.log("Reason: " + reasons.join(", "));
         console.log("Strike: " + updated + "/3");
-        console.log("Text: " + visibleText.substring(0, 100));
+        console.log("Text: " + _snip(visibleText, 200));
 
-        enqueueBulkViolation(groupJid, senderJid, senderId, msg.key, reasons, updated, { forceRemove: updated >= 3 });
+        enqueueBulkViolation(groupJid, senderJid, senderId, msg.key, reasons, updated, {
+          forceRemove: updated >= 3,
+          debugTag: "violation",
+          sampleText: _snip(visibleText, 220)
+        });
+
         console.log("");
       } catch (e) {
         console.log("⚠️ Error:", e?.message);
@@ -1124,7 +1300,7 @@ async function startBot() {
             const bannedAt = floodBanned.get(rateKey);
             if (bannedAt && (now - bannedAt) < FLOOD_BAN_TTL_MS) {
               const backKeys = getRecentSenderKeys(rateKey);
-              enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood-ban'], 3, { forceRemove: true, delayMs: 0 });
+              enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood-ban'], 3, { forceRemove: true, delayMs: 0, debugTag: "ingest-floodBan-active" });
               continue;
             }
 
@@ -1138,7 +1314,7 @@ async function startBot() {
               userViolations.set(rateKey, 3);
               console.log('🚨 FLOOD-BAN(ingest): ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
               const backKeys = getRecentSenderKeys(rateKey);
-              enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, { forceRemove: true, delayMs: 0 });
+              enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, { forceRemove: true, delayMs: 0, debugTag: "ingest-floodBan-trip" });
               continue;
             }
           }
@@ -1186,7 +1362,7 @@ async function startBot() {
                 if (senderJid && bannedAt && (Date.now() - bannedAt) < FLOOD_BAN_TTL_MS) {
                   rememberSenderKey(rateKey, msg.key);
                   const backKeys = getRecentSenderKeys(rateKey);
-                  enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood-ban'], 3, { forceRemove: true, delayMs: 0 });
+                  enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood-ban'], 3, { forceRemove: true, delayMs: 0, debugTag: "drain-floodBan-active" });
                   return;
                 }
               } catch {}
