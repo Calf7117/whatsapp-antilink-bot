@@ -254,8 +254,8 @@ function getSenderJidForMsg(msg) {
   try {
     if (!msg?.key) return "";
     const remote = String(msg.key.remoteJid || "");
-    // For group messages, ONLY participant identifies the sender. Never fall back to the group JID.
-    if (remote.endsWith("@g.us")) return String(msg.key.participant || msg.participant || "");
+    // For group messages, ONLY msg.key.participant identifies the sender. Never fall back to the group JID.
+    if (remote.endsWith("@g.us")) return String(msg.key.participant || "");
     return remote;
   } catch { return ""; }
 }
@@ -266,7 +266,7 @@ function isSelfMessage(msg) {
   if (!msg?.key) return false;
   if (msg.key.fromMe) return true;
 
-  const sender = getSenderJidForMsg(msg) || msg.key.participant || msg.key.remoteJid;
+  const sender = getSenderJidForMsg(msg) || msg.key.participant || (String(msg.key.remoteJid || '').endsWith('@g.us') ? '' : msg.key.remoteJid);
   if (BOT_SELF_JID && sender === BOT_SELF_JID) return true;
 
   // if we know bot phone, match against sender
@@ -937,11 +937,9 @@ async function handleMessage(msg) {
         if (!msg.message) return;
 
         const groupJid = msg.key.remoteJid;
+        // For groups, never use the group JID as sender identity.
+        // If participant is missing, we can still delete messages by msg.key, but removal attribution may be skipped.
         const senderJid = getSenderJidForMsg(msg) || msg.key.participant || msg.participant || "";
-        if (!senderJid) {
-          if (DEBUG_MODE) console.log("⚠️ Missing participant (senderJid) in group message; skipping moderation for safety");
-          return;
-        }
         const __unwrappedMsg = unwrapMessageContent(msg.message);
         const msg0 = (__unwrappedMsg === msg.message) ? msg : { ...msg, message: __unwrappedMsg };
         const visibleText = extractVisibleText(msg0).trim();
@@ -1022,14 +1020,15 @@ async function handleMessage(msg) {
         try {
           const earlyLink = detectLinks(visibleText);
           if (earlyLink) {
-            const senderId0 = senderPhone || senderJid;
+            // Even if sender identity is missing, we can still delete by msg.key.
+            const senderId0 = senderPhone || senderJid || ('unknown-' + (msg.key?.id || Date.now()));
             const rateKey0 = groupJid + '-' + senderId0;
-            rememberSenderKey(rateKey0, msg.key);
+            try { rememberSenderKey(rateKey0, msg.key); } catch {}
             const userKey0 = rateKey0;
             const current0 = userViolations.get(userKey0) || 0;
             const updated0 = current0 + 1;
             userViolations.set(userKey0, updated0);
-            enqueueBulkViolation(groupJid, senderJid, senderId0, msg.key, ['link'], updated0, { forceRemove: updated0 >= 3 });
+            enqueueBulkViolation(groupJid, senderJid || (msg.key?.participant || ''), senderId0, msg.key, ['link'], updated0, { forceRemove: updated0 >= 3 });
             return;
           }
         } catch {}
@@ -1121,6 +1120,7 @@ async function handleMessage(msg) {
     if (!msg.message) continue;
 
     // Backcheck + PRIORITY flood-ban at ingest time (before queueing) to prevent queue blowups/hangs
+    // IMPORTANT: never drop a message just because participant is missing; we can still delete by msg.key.
     let groupJid = null;
     let senderJid = null;
     let senderPhone = null;
@@ -1130,35 +1130,37 @@ async function handleMessage(msg) {
     try {
       groupJid = msg.key.remoteJid;
       senderJid = getSenderJidForMsg(msg) || msg.key.participant || msg.participant || '';
-      if (!senderJid) continue;
-      senderPhone = extractPhoneNumber(senderJid);
-      senderId = senderPhone || senderJid;
-      rateKey = groupJid + '-' + senderId;
-      now = Date.now();
+      // If sender is missing, skip rate-limit attribution but still enqueue for link checks/deletes.
+      if (senderJid) {
+        senderPhone = extractPhoneNumber(senderJid);
+        senderId = senderPhone || senderJid;
+        rateKey = groupJid + '-' + senderId;
+        now = Date.now();
 
-      rememberSenderKey(rateKey, msg.key);
+        rememberSenderKey(rateKey, msg.key);
 
-      // Never rate-limit/remove exempt messages (owner/self/fromMe)
-      if (!isExempt(msg)) {
-        const bannedAt = floodBanned.get(rateKey);
-        if (bannedAt && (now - bannedAt) < FLOOD_BAN_TTL_MS) {
-          const backKeys = getRecentSenderKeys(rateKey);
-          enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood-ban'], 3, { forceRemove: true, delayMs: 0 });
-          continue;
-        }
+        // Never rate-limit/remove exempt messages (owner/self/fromMe)
+        if (!isExempt(msg)) {
+          const bannedAt = floodBanned.get(rateKey);
+          if (bannedAt && (now - bannedAt) < FLOOD_BAN_TTL_MS) {
+            const backKeys = getRecentSenderKeys(rateKey);
+            enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood-ban'], 3, { forceRemove: true, delayMs: 0 });
+            continue;
+          }
 
-        const arr = senderRate.get(rateKey) || [];
-        const pruned = arr.filter((ts) => (now - ts) < FLOOD_WINDOW_MS);
-        pruned.push(now);
-        senderRate.set(rateKey, pruned);
+          const arr = senderRate.get(rateKey) || [];
+          const pruned = arr.filter((ts) => (now - ts) < FLOOD_WINDOW_MS);
+          pruned.push(now);
+          senderRate.set(rateKey, pruned);
 
-        if (pruned.length > FLOOD_MAX_MSG) {
-          floodBanned.set(rateKey, now);
-          userViolations.set(rateKey, 3);
-          console.log('🚨 FLOOD-BAN(ingest): ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
-          const backKeys = getRecentSenderKeys(rateKey);
-          enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, { forceRemove: true, delayMs: 0 });
-          continue;
+          if (pruned.length > FLOOD_MAX_MSG) {
+            floodBanned.set(rateKey, now);
+            userViolations.set(rateKey, 3);
+            console.log('🚨 FLOOD-BAN(ingest): ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
+            const backKeys = getRecentSenderKeys(rateKey);
+            enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, { forceRemove: true, delayMs: 0 });
+            continue;
+          }
         }
       }
     } catch {}
@@ -1201,7 +1203,8 @@ async function drainIncomingQueue() {
           try {
             const groupJid = msg.key.remoteJid;
             const senderJid = getSenderJidForMsg(msg) || msg.key.participant || msg.participant || '';
-            if (!senderJid) return;
+            // If sender is missing, skip flood-ban shortcut but still run moderation checks.
+            if (!senderJid) return handleMessage(msg);
             const senderPhone = extractPhoneNumber(senderJid);
             const senderId = senderPhone || senderJid;
             const rateKey = groupJid + '-' + senderId;
