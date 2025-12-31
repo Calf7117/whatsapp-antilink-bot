@@ -25,7 +25,7 @@ http.createServer((req, res) => {
   res.end("Anti-Link Bot Running");
 }).listen(PORT, () => console.log("Health server on port " + PORT));
 
-console.log("🔧 Build: 2025-12-31 (readd-fix + decrypt-harden + safe-regexp + diag-logs)");
+console.log("\ud83d\udd27 Build: 2025-12-31 (readd-fix + decrypt-harden + safe-regexp + diag-logs)");
 
 // IMPORTANT CHANGE:
 // Track strikes by normalized phone (not raw JID) so device-variants don't create new strike buckets.
@@ -84,6 +84,38 @@ let BOT_SELF_PHONE = "";
 // IMPORTANT: Your logs show: 22793995452644@lid
 let OWNER_LID = process.env.OWNER_LID || "22793995452644@lid";
 
+// Session env tracking (helps "pair once" and fixes bad/truncated env values)
+let SESSION_ENV_STATUS = "unknown"; // unknown | missing | valid | invalid
+let SESSION_ENV_REASON = "";
+
+function localAuthExists() {
+  try {
+    if (!fs.existsSync(AUTH_FOLDER)) return false;
+    const files = fs.readdirSync(AUTH_FOLDER).filter((f) => f && f.endsWith('.json'));
+    return files.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function validateSessionEnv(encrypted) {
+  try {
+    const s = String(encrypted || '').trim().replace(/^['"]|['"]$/g, '').replace(/\s+/g, '').replace(/[^0-9a-fA-F:]/g, '');
+    if (!s) return { ok: false, reason: 'empty' };
+    if (!s.includes(':')) return { ok: false, reason: "missing ':' separator" };
+    const parts = s.split(':');
+    const ivHex = String(parts.shift() || '');
+    const ctHex = String(parts.join(':') || '');
+    if (ivHex.length !== 32 || !/^[0-9a-fA-F]+$/.test(ivHex)) return { ok: false, reason: 'invalid IV hex' };
+    if (!ctHex) return { ok: false, reason: 'missing ciphertext' };
+    if ((ctHex.length % 2) !== 0) return { ok: false, reason: 'ciphertext hex length odd (truncated)', len: ctHex.length };
+    if (!/^[0-9a-fA-F]+$/.test(ctHex)) return { ok: false, reason: 'ciphertext contains non-hex' };
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: 'validator error: ' + String(e?.message || e) };
+  }
+}
+
 const createSilentLogger = () => {
   const noOp = () => {};
   return {
@@ -100,7 +132,7 @@ function _ts() {
 function _snip(s, n = 140) {
   const t = String(s || "");
   if (t.length <= n) return t;
-  return t.slice(0, n) + "…";
+  return t.slice(0, n) + "\u2026";
 }
 
 function _msgKeyInfo(msgKey) {
@@ -141,17 +173,24 @@ function encrypt(text) {
   }
 }
 
-// FIX: Harden decrypt to prevent Render env whitespace/quotes/truncation from crashing Buffer/crypto.
 function decrypt(text) {
   try {
     let raw = String(text || "");
     raw = raw.trim();
-    raw = raw.replace(/^['\"]|['\"]$/g, "");
+    raw = raw.replace(/^['"]|['"]$/g, "");
     raw = raw.replace(/\s+/g, "");
     raw = raw.replace(/[^0-9a-fA-F:]/g, "");
 
-    if (!raw || !raw.includes(":")) {
-      if (raw) console.log("Decryption error: WHATSAPP_SESSION missing ':' separator");
+    if (!raw) {
+      SESSION_ENV_STATUS = "missing";
+      SESSION_ENV_REASON = "WHATSAPP_SESSION empty";
+      return null;
+    }
+
+    if (!raw.includes(":")) {
+      SESSION_ENV_STATUS = "invalid";
+      SESSION_ENV_REASON = "missing ':' separator";
+      console.log("Decryption error: WHATSAPP_SESSION missing ':' separator");
       return null;
     }
 
@@ -160,18 +199,26 @@ function decrypt(text) {
     const encryptedHex = String(parts.join(":") || "");
 
     if (ivHex.length !== 32 || !/^[0-9a-fA-F]+$/.test(ivHex)) {
+      SESSION_ENV_STATUS = "invalid";
+      SESSION_ENV_REASON = "invalid IV hex";
       console.log("Decryption error: invalid IV hex (expected 32 hex chars). Got length=" + ivHex.length);
       return null;
     }
     if (!encryptedHex) {
+      SESSION_ENV_STATUS = "invalid";
+      SESSION_ENV_REASON = "missing ciphertext";
       console.log("Decryption error: missing ciphertext");
       return null;
     }
     if ((encryptedHex.length % 2) !== 0) {
+      SESSION_ENV_STATUS = "invalid";
+      SESSION_ENV_REASON = "ciphertext hex length odd (truncated)";
       console.log("Decryption error: ciphertext hex length is odd (truncated env var). Length=" + encryptedHex.length);
       return null;
     }
     if (!/^[0-9a-fA-F]+$/.test(encryptedHex)) {
+      SESSION_ENV_STATUS = "invalid";
+      SESSION_ENV_REASON = "ciphertext contains non-hex";
       console.log("Decryption error: ciphertext contains non-hex characters");
       return null;
     }
@@ -180,8 +227,13 @@ function decrypt(text) {
     const decipher = crypto.createDecipheriv("aes-256-cbc", getEncryptionKey(), iv);
     let decrypted = decipher.update(encryptedHex, "hex", "utf8");
     decrypted += decipher.final("utf8");
+
+    SESSION_ENV_STATUS = "valid";
+    SESSION_ENV_REASON = "";
     return decrypted;
   } catch (error) {
+    SESSION_ENV_STATUS = "invalid";
+    SESSION_ENV_REASON = "crypto error: " + String(error?.message || error);
     console.log("Decryption error:", error.message);
     return null;
   }
@@ -190,17 +242,42 @@ function decrypt(text) {
 function restoreSessionFromEnv() {
   try {
     const encrypted = process.env.WHATSAPP_SESSION;
+
+    if (encrypted) {
+      const v = validateSessionEnv(encrypted);
+      if (v.ok) {
+        SESSION_ENV_STATUS = 'valid';
+        SESSION_ENV_REASON = '';
+      } else {
+        SESSION_ENV_STATUS = 'invalid';
+        SESSION_ENV_REASON = v.reason + (v.len ? (' (len=' + v.len + ')') : '');
+      }
+    } else {
+      SESSION_ENV_STATUS = 'missing';
+      SESSION_ENV_REASON = 'WHATSAPP_SESSION not set';
+    }
+
+    if (localAuthExists()) {
+      if (!restoreSessionFromEnv._warned && SESSION_ENV_STATUS === 'invalid') {
+        restoreSessionFromEnv._warned = true;
+        console.log('\u26a0\ufe0f WHATSAPP_SESSION env appears INVALID (' + (SESSION_ENV_REASON || 'unknown') + '). Using local auth files; please update env to avoid future re-pairing.');
+      } else {
+        console.log("\u2139\ufe0f Local auth files found; skipping env restore");
+      }
+      return true;
+    }
+
     if (!encrypted) {
-      console.log("ℹ️ No saved session found in environment variables");
+      console.log("\u2139\ufe0f No saved session found in environment variables");
       return false;
     }
 
-    console.log("🔄 Restoring session from environment variable...");
+    console.log("\ud83d\udd04 Restoring session from environment variable...");
     const decrypted = decrypt(encrypted);
     if (!decrypted) {
-      console.log("❌ Failed to decrypt session");
-      console.log("🧩 Likely causes: (1) WHATSAPP_SESSION value is truncated/corrupted, or (2) SESSION_KEY changed since session was generated.");
-      console.log("✅ Fix: restore the original SESSION_KEY, OR delete WHATSAPP_SESSION env var to force a fresh pairing, then redeploy.");
+      console.log("\u274c Failed to decrypt session");
+      console.log("\ud83e\udde9 Likely causes: (1) WHATSAPP_SESSION value is truncated/corrupted, or (2) SESSION_KEY changed since session was generated.");
+      console.log("\u2705 Fix: restore the original SESSION_KEY, OR delete WHATSAPP_SESSION env var to force a fresh pairing, then redeploy.");
       return false;
     }
 
@@ -212,19 +289,21 @@ function restoreSessionFromEnv() {
       fs.writeFileSync(filePath, JSON.stringify(content, null, 2));
     }
 
-    console.log("✅ Session restored successfully!");
+    console.log("\u2705 Session restored successfully!");
     return true;
   } catch (error) {
-    console.log("❌ Error restoring session:", error.message);
+    SESSION_ENV_STATUS = "invalid";
+    SESSION_ENV_REASON = "restore error: " + String(error?.message || error);
+    console.log("\u274c Error restoring session:", error.message);
     return false;
   }
 }
 
 function saveSessionToEnv() {
   try {
-    // If you already set WHATSAPP_SESSION in Render env, do NOT keep printing new values.
-    // The session content is equivalent (new IV each time) and repeated printing causes confusion.
-    if (process.env.WHATSAPP_SESSION && String(process.env.WHATSAPP_SESSION).trim().length > 40) return;
+    const hasEnv = !!(process.env.WHATSAPP_SESSION && String(process.env.WHATSAPP_SESSION).trim().length > 40);
+    if (hasEnv && SESSION_ENV_STATUS === 'valid') return;
+
     if (saveSessionToEnv._shown) return;
     if (!fs.existsSync(AUTH_FOLDER)) return;
 
@@ -246,20 +325,26 @@ function saveSessionToEnv() {
 
     console.log("");
     console.log("=".repeat(60));
-    console.log("📁 COPY THIS SESSION DATA TO RENDER ENVIRONMENT VARIABLE:");
+    console.log("\ud83d\udcc1 COPY THIS SESSION DATA TO RENDER ENVIRONMENT VARIABLE:");
     console.log("=".repeat(60));
     console.log("VARIABLE NAME: WHATSAPP_SESSION");
     console.log("VARIABLE VALUE:");
     console.log(encrypted);
+
+    if (SESSION_ENV_STATUS === 'invalid') {
+      console.log("\u26a0\ufe0f NOTE: Your current WHATSAPP_SESSION env looks INVALID (" + (SESSION_ENV_REASON || 'unknown') + ").");
+      console.log("\u2705 Replace WHATSAPP_SESSION in Render with the value above, then Save + Deploy.");
+    }
+
     saveSessionToEnv._shown = true;
     console.log("=".repeat(60));
-    console.log("1. Go to Render Dashboard → Your Service → Environment");
+    console.log("1. Go to Render Dashboard \u2192 Your Service \u2192 Environment");
     console.log("2. Add/Update Environment Variable: WHATSAPP_SESSION");
     console.log("3. Paste the value above");
     console.log("=".repeat(60));
     console.log("");
   } catch (error) {
-    console.log("❌ Error saving session:", error.message);
+    console.log("\u274c Error saving session:", error.message);
   }
 }
 
@@ -323,7 +408,9 @@ function isSelfMessage(msg) {
 
   const sender = getSenderJidForMsg(msg) || msg.key.participant || (String(msg.key.remoteJid || '').endsWith('@g.us') ? '' : msg.key.remoteJid);
   if (BOT_SELF_JID && sender === BOT_SELF_JID) return true;
+
   if (BOT_SELF_PHONE && jidMatchesNumber(sender, BOT_SELF_PHONE)) return true;
+
   return false;
 }
 
@@ -354,11 +441,11 @@ const LINK_BRACKET_DOT_REGEX = (() => {
 })();
 const LINK_BRACKET_SLASH_REGEX = (() => {
   try { return new RegExp("[\\[\\(\\{]\\s*(?:\\/|slash)\\s*[\\]\\)\\}]", "gi"); }
-  catch { return new RegExp("\\\\[\\\\s*(?:\\/|slash)\\\\s*\\\\]", "gi"); }
+  catch { return new RegExp("\\\\[\\\\s*(?:\\/|slash)\\s*\\\\]", "gi"); }
 })();
 const LINK_BRACKET_COLON_REGEX = (() => {
   try { return new RegExp("[\\[\\(\\{]\\s*(?::|colon)\\s*[\\]\\)\\}]", "gi"); }
-  catch { return new RegExp("\\\\[\\\\s*(?::|colon)\\\\s*\\\\]", "gi"); }
+  catch { return new RegExp("\\\\[\\\\s*(?::|colon)\\s*\\\\]", "gi"); }
 })();
 
 function normalizeForLinkDetect(text) {
@@ -389,10 +476,17 @@ function _dehxxp(s) {
 
 function detectLinks(text) {
   if (!text) return false;
+
   const t0 = normalizeForLinkDetect(text);
+  const lc0 = t0.toLowerCase();
+
+  if (lc0.includes('http://') || lc0.includes('https://') || lc0.includes('www.')) return true;
+
   if (FAST_LINK_REGEX.test(t0)) return true;
 
   const t1 = _compactForLinkDetect(t0);
+  const lc1 = t1.toLowerCase();
+  if (lc1.includes('http://') || lc1.includes('https://') || lc1.includes('www.')) return true;
   if (t1 !== t0 && FAST_LINK_REGEX.test(t1)) return true;
 
   const t2 = _stripBrackets(t1);
@@ -757,7 +851,7 @@ function enqueueBulkViolation(groupJid, senderJid, senderId, msgKeyOrKeys, reaso
   }
 
   if (DEBUG_MODE && options.debugTag) {
-    console.log("📌 enqueueBulkViolation", {
+    console.log("\ud83d\udccc enqueueBulkViolation", {
       ts: _ts(),
       debugTag: options.debugTag,
       key,
@@ -773,6 +867,8 @@ function enqueueBulkViolation(groupJid, senderJid, senderId, msgKeyOrKeys, reaso
     });
   }
 }
+
+let sockRef = null;
 
 async function flushBulkViolation(key) {
   const rec = pendingActions.get(key);
@@ -790,7 +886,7 @@ async function flushBulkViolation(key) {
   if (DEBUG_MODE) {
     const reasonsObj = {};
     for (const [r, c] of rec.reasons.entries()) reasonsObj[r] = c;
-    console.log('🧹 Bulk action start:', {
+    console.log('\ud83e\uddf9 Bulk action start:', {
       ts: _ts(),
       key,
       groupJid: rec.groupJid,
@@ -824,7 +920,7 @@ async function flushBulkViolation(key) {
   }
 
   if (DEBUG_MODE) {
-    console.log('🧹 Bulk action delete summary:', {
+    console.log('\ud83e\uddf9 Bulk action delete summary:', {
       ts: _ts(),
       key,
       ok: okCount,
@@ -843,7 +939,7 @@ async function flushBulkViolation(key) {
     const removed = await safeRemove(rec.groupJid, rec.senderJid);
 
     if (DEBUG_MODE) {
-      console.log('👢 Remove attempt:', {
+      console.log('\ud83d\udc62 Remove attempt:', {
         ts: _ts(),
         key,
         groupJid: rec.groupJid,
@@ -870,7 +966,7 @@ async function startBot() {
     const keyStore = makeCacheableSignalKeyStore(state.keys, createSilentLogger());
 
     const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log("📱 WA v" + version.join(".") + " (latest: " + isLatest + ")");
+    console.log("\ud83d\udcf1 WA v" + version.join(".") + " (latest: " + isLatest + ")");
 
     const sock = makeWASocket({
       version,
@@ -890,28 +986,28 @@ async function startBot() {
 
     if (!state.creds.registered) {
       console.log("");
-      console.log("📱 Requesting pairing code for: " + ADMIN_NUMBER);
-      console.log("⏳ Please wait...");
+      console.log("\ud83d\udcf1 Requesting pairing code for: " + ADMIN_NUMBER);
+      console.log("\u23f3 Please wait...");
       await new Promise(r => setTimeout(r, 3000));
       try {
         const code = await sock.requestPairingCode(ADMIN_NUMBER);
         console.log("");
-        console.log("╔════════════════════════════════════════╗");
-        console.log("║ 📱 PAIRING CODE (Valid for 60 seconds) ║");
-        console.log("╠════════════════════════════════════════╣");
-        console.log("║                                        ║");
-        console.log("║     " + code + "                         ║");
-        console.log("║                                        ║");
-        console.log("╠════════════════════════════════════════╣");
-        console.log("║ 1. Open WhatsApp on your phone         ║");
-        console.log("║ 2. Go to: Settings → Linked Devices    ║");
-        console.log("║ 3. Tap 'Link a Device'                 ║");
-        console.log("║ 4. Enter the 8-digit code above        ║");
-        console.log("╚════════════════════════════════════════╝");
+        console.log("\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557");
+        console.log("\u2551 \ud83d\udcf1 PAIRING CODE (Valid for 60 seconds) \u2551");
+        console.log("\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563");
+        console.log("\u2551                                        \u2551");
+        console.log("\u2551     " + code + "                         \u2551");
+        console.log("\u2551                                        \u2551");
+        console.log("\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563");
+        console.log("\u2551 1. Open WhatsApp on your phone         \u2551");
+        console.log("\u2551 2. Go to: Settings \u2192 Linked Devices    \u2551");
+        console.log("\u2551 3. Tap 'Link a Device'                 \u2551");
+        console.log("\u2551 4. Enter the 8-digit code above        \u2551");
+        console.log("\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d");
         console.log("");
       } catch (e) {
-        console.log("⚠️ Pairing code error:", e?.message);
-        console.log("🔄 Will retry in 10 seconds...");
+        console.log("\u26a0\ufe0f Pairing code error:", e?.message);
+        console.log("\ud83d\udd04 Will retry in 10 seconds...");
       }
     }
 
@@ -930,19 +1026,19 @@ async function startBot() {
         BOT_SELF_PHONE = extractPhoneNumber(BOT_SELF_JID);
 
         console.log("");
-        console.log("╔══════════════════════════════════════════╗");
-        console.log("║ ✅ ANTI-LINK BOT ONLINE                  ║");
-        console.log("╠══════════════════════════════════════════╣");
-        console.log("║ 🤖 Bot: " + (BOT_SELF_JID || "unknown").substring(0,30).padEnd(31) + "║");
-        console.log("║ 👑 Owner: " + String(ADMIN_NUMBER).padEnd(30) + "║");
-        console.log("║ 📋 Mode: All groups                      ║");
-        console.log("║ 🚀 Hi/Lo queue + bulk moderation         ║");
-        console.log("║ 🧾 Diagnostic logs enabled               ║");
-        console.log("╚══════════════════════════════════════════╝");
+        console.log("\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557");
+        console.log("\u2551 \u2705 ANTI-LINK BOT ONLINE                  \u2551");
+        console.log("\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563");
+        console.log("\u2551 \ud83e\udd16 Bot: " + (BOT_SELF_JID || "unknown").substring(0,30).padEnd(31) + "\u2551");
+        console.log("\u2551 \ud83d\udc51 Owner: " + String(ADMIN_NUMBER).padEnd(30) + "\u2551");
+        console.log("\u2551 \ud83d\udccb Mode: All groups                      \u2551");
+        console.log("\u2551 \ud83d\ude80 Hi/Lo queue + bulk moderation         \u2551");
+        console.log("\u2551 \ud83e\uddfe Diagnostic logs enabled               \u2551");
+        console.log("\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d");
         console.log("");
 
         if (DEBUG_MODE) {
-          console.log("🔎 Debug owner match targets:");
+          console.log("\ud83d\udd0e Debug owner match targets:");
           console.log("- ADMIN_NUMBER: " + ADMIN_NUMBER);
           console.log("- BOT_SELF_JID: " + BOT_SELF_JID);
           console.log("- BOT_SELF_PHONE: " + BOT_SELF_PHONE);
@@ -956,14 +1052,14 @@ async function startBot() {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const reason = lastDisconnect?.error?.message || "unknown";
 
-        console.log("🔌 Connection closed: " + reason);
+        console.log("\ud83d\udd0c Connection closed: " + reason);
 
         if (statusCode === DisconnectReason.loggedOut) {
-          console.log("❌ Logged out. Delete WHATSAPP_SESSION env var and redeploy.");
+          console.log("\u274c Logged out. Delete WHATSAPP_SESSION env var and redeploy.");
           if (fs.existsSync(AUTH_FOLDER)) fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
         } else {
           const delay = hasConnectedBefore ? 5000 : 10000;
-          console.log("🔄 Reconnecting in " + (delay/1000) + " seconds...");
+          console.log("\ud83d\udd04 Reconnecting in " + (delay/1000) + " seconds...");
           setTimeout(() => startBot().catch(console.error), delay);
         }
       }
@@ -983,7 +1079,7 @@ async function startBot() {
 
         if (age < NOT_ADMIN_CACHE_TTL && (now - lastProbe) < PROBE_EVERY_MS) {
           if (DEBUG_MODE) {
-            console.log("🧱 delete skipped (cached not-admin)", {
+            console.log("\ud83e\uddf1 delete skipped (cached not-admin)", {
               ts: _ts(),
               groupJid,
               ageMs: age,
@@ -997,7 +1093,7 @@ async function startBot() {
         }
 
         safeDelete._lastProbeAt.set(groupJid, now);
-        if (DEBUG_MODE) console.log("🔁 delete re-probe despite notAdmin cache", { ts: _ts(), groupJid, ageMs: age, meta, msgKey: keyInfo });
+        if (DEBUG_MODE) console.log("\ud83d\udd01 delete re-probe despite notAdmin cache", { ts: _ts(), groupJid, ageMs: age, meta, msgKey: keyInfo });
       }
 
       const maxAttempts = 3;
@@ -1006,17 +1102,17 @@ async function startBot() {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         if (delay) await new Promise(r => setTimeout(r, delay));
         try {
-          if (DEBUG_MODE) console.log("🗑️ delete attempt", { ts: _ts(), groupJid, attempt, meta, msgKey: keyInfo });
+          if (DEBUG_MODE) console.log("\ud83d\uddd1\ufe0f delete attempt", { ts: _ts(), groupJid, attempt, meta, msgKey: keyInfo });
           await sock.sendMessage(groupJid, { delete: msgKey });
           if (notAdminGroups.has(groupJid)) notAdminGroups.delete(groupJid);
-          if (DEBUG_MODE) console.log("✅ delete ok", { ts: _ts(), groupJid, meta, msgKey: keyInfo });
+          if (DEBUG_MODE) console.log("\u2705 delete ok", { ts: _ts(), groupJid, meta, msgKey: keyInfo });
           return true;
         } catch (e) {
           const errMsg = String(e?.message || e || "");
           const statusCode = e?.output?.statusCode || e?.statusCode || e?.status;
 
           if (DEBUG_MODE) {
-            console.log("❌ delete failed", {
+            console.log("\u274c delete failed", {
               ts: _ts(),
               groupJid,
               attempt,
@@ -1034,14 +1130,14 @@ async function startBot() {
 
           if (statusCode === 403 || errMsg.includes("forbidden") || errMsg.includes("not-authorized")) {
             notAdminGroups.set(groupJid, Date.now());
-            console.log("📝 Not admin in this group (or delete not permitted) - caching for 1 hour");
+            console.log("\ud83d\udcdd Not admin in this group (or delete not permitted) - caching for 1 hour");
           }
 
           break;
         }
       }
 
-      if (DEBUG_MODE) console.log("❌ delete gave up", { ts: _ts(), groupJid, meta, msgKey: keyInfo, notAdminCached: notAdminGroups.has(groupJid) });
+      if (DEBUG_MODE) console.log("\u274c delete gave up", { ts: _ts(), groupJid, meta, msgKey: keyInfo, notAdminCached: notAdminGroups.has(groupJid) });
       return false;
     }
 
@@ -1050,21 +1146,21 @@ async function startBot() {
         if (!userJid) return false;
 
         if (BOT_SELF_JID && String(userJid) === String(BOT_SELF_JID)) {
-          console.log("🛡️ Refused to remove bot self");
+          console.log("\ud83d\udee1\ufe0f Refused to remove bot self");
           return false;
         }
 
         if (jidMatchesNumber(userJid, ADMIN_NUMBER) || (BOT_SELF_PHONE && jidMatchesNumber(userJid, BOT_SELF_PHONE))) {
-          console.log("🛡️ Refused to remove owner/self");
+          console.log("\ud83d\udee1\ufe0f Refused to remove owner/self");
           return false;
         }
 
         await sock.groupParticipantsUpdate(groupJid, [userJid], "remove");
-        console.log("✅ User removed from group");
+        console.log("\u2705 User removed from group");
         if (notAdminGroups.has(groupJid)) notAdminGroups.delete(groupJid);
         return true;
       } catch (e) {
-        console.log("⚠️ Could not remove user:", e?.message);
+        console.log("\u26a0\ufe0f Could not remove user:", e?.message);
         return false;
       }
     }
@@ -1087,15 +1183,15 @@ async function startBot() {
         const textLower = visibleText.toLowerCase();
 
         if (textLower === "!bot") {
-          console.log("📨 !bot command from:", senderJid);
+          console.log("\ud83d\udce8 !bot command from:", senderJid);
           try {
-            let responseText = "✅ ANTI-LINK BOT ACTIVE\n";
-            responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
-            responseText += "💃 We R 🆗 Baby!! 🤫\n";
+            let responseText = "\u2705 ANTI-LINK BOT ACTIVE\n";
+            responseText += "\ud83d\udc51 Owner: " + ADMIN_NUMBER + "\n";
+            responseText += "\ud83d\udc83 We R \ud83c\udd97 Baby!! \ud83e\udd2b\n";
             await sock.sendMessage(groupJid, { text: responseText });
-            console.log("✅ Sent !bot response");
+            console.log("\u2705 Sent !bot response");
           } catch (e) {
-            console.log("⚠️ Could not send !bot reply:", e?.message);
+            console.log("\u26a0\ufe0f Could not send !bot reply:", e?.message);
           }
           return;
         }
@@ -1114,7 +1210,7 @@ async function startBot() {
         );
 
         if (DEBUG_MODE) {
-          console.log("🧾 owner-check:", {
+          console.log("\ud83e\uddfe owner-check:", {
             senderJid,
             senderPhone,
             fromMe: !!msg.key.fromMe,
@@ -1132,7 +1228,7 @@ async function startBot() {
         }
 
         if (exempt || hardOwner) {
-          if (DEBUG_MODE) console.log("👑 Exempt message - skipping checks");
+          if (DEBUG_MODE) console.log("\ud83d\udc51 Exempt message - skipping checks");
           return;
         }
 
@@ -1140,7 +1236,7 @@ async function startBot() {
         const linkish = _looksLinkish(visibleText);
 
         if (DEBUG_MODE && linkish && !earlyLink) {
-          console.log("⚠️ linkish-but-not-detected", {
+          console.log("\u26a0\ufe0f linkish-but-not-detected", {
             ts: _ts(),
             senderJid,
             groupJid,
@@ -1192,7 +1288,7 @@ async function startBot() {
         if (pruned.length > FLOOD_MAX_MSG) {
           floodBanned.set(rateKey, now);
           userViolations.set(rateKey, 3);
-          console.log('🚨 FLOOD-BAN: ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
+          console.log('\ud83d\udea8 FLOOD-BAN: ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
           const backKeys = getRecentSenderKeys(rateKey);
           enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, {
             forceRemove: true,
@@ -1219,7 +1315,7 @@ async function startBot() {
         if (DEBUG_MODE) {
           const shouldLogEval = linkish || hasPhone || keyword || buttons || contact || apk || zip || audio || business;
           if (shouldLogEval) {
-            console.log("🧪 eval", {
+            console.log("\ud83e\uddea eval", {
               ts: _ts(),
               groupJid,
               senderJid,
@@ -1262,7 +1358,7 @@ async function startBot() {
         userViolations.set(userKey, updated);
 
         console.log("");
-        console.log("🚫 VIOLATION DETECTED");
+        console.log("\ud83d\udeab VIOLATION DETECTED");
         console.log("User: " + senderJid);
         console.log("Group: " + groupJid);
         console.log("Reason: " + reasons.join(", "));
@@ -1277,7 +1373,7 @@ async function startBot() {
 
         console.log("");
       } catch (e) {
-        console.log("⚠️ Error:", e?.message);
+        console.log("\u26a0\ufe0f Error:", e?.message);
       }
     }
 
@@ -1312,7 +1408,7 @@ async function startBot() {
             if (pruned.length > FLOOD_MAX_MSG) {
               floodBanned.set(rateKey, now);
               userViolations.set(rateKey, 3);
-              console.log('🚨 FLOOD-BAN(ingest): ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
+              console.log('\ud83d\udea8 FLOOD-BAN(ingest): ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
               const backKeys = getRecentSenderKeys(rateKey);
               enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, { forceRemove: true, delayMs: 0, debugTag: "ingest-floodBan-trip" });
               continue;
@@ -1393,11 +1489,11 @@ async function startBot() {
     });
 
     setInterval(cleanupCaches, 30000);
-    console.log("🚀 Bot initialized - waiting for connection...");
+    console.log("\ud83d\ude80 Bot initialized - waiting for connection...");
 
   } catch (e) {
-    console.log("❌ Start error:", e.message);
-    console.log("🔄 Retrying in 30 seconds...");
+    console.log("\u274c Start error:", e.message);
+    console.log("\ud83d\udd04 Retrying in 30 seconds...");
     setTimeout(() => startBot().catch(() => {}), 30000);
   }
 }
