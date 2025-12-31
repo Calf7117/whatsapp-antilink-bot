@@ -159,6 +159,10 @@ function restoreSessionFromEnv() {
 
 function saveSessionToEnv() {
   try {
+    // If you already set WHATSAPP_SESSION in Render env, do NOT keep printing new values.
+    // The session content is equivalent (new IV each time) and repeated printing causes confusion.
+    if (process.env.WHATSAPP_SESSION && String(process.env.WHATSAPP_SESSION).trim().length > 40) return;
+    if (saveSessionToEnv._shown) return;
     if (!fs.existsSync(AUTH_FOLDER)) return;
 
     const files = fs.readdirSync(AUTH_FOLDER);
@@ -184,6 +188,7 @@ function saveSessionToEnv() {
     console.log("VARIABLE NAME: WHATSAPP_SESSION");
     console.log("VARIABLE VALUE:");
     console.log(encrypted);
+    saveSessionToEnv._shown = true;
     console.log("=".repeat(60));
     console.log("1. Go to Render Dashboard → Your Service → Environment");
     console.log("2. Add/Update Environment Variable: WHATSAPP_SESSION");
@@ -245,6 +250,15 @@ function isOwnerLid(senderJid) {
   return String(senderJid) === String(OWNER_LID);
 }
 
+function getSenderJidForMsg(msg) {
+  try {
+    if (!msg?.key) return "";
+    const remote = String(msg.key.remoteJid || "");
+    // For group messages, ONLY participant identifies the sender. Never fall back to the group JID.
+    if (remote.endsWith("@g.us")) return String(msg.key.participant || msg.participant || "");
+    return remote;
+  } catch { return ""; }
+}
 function isSelfMessage(msg) {
   // Multi-device reality:
   // - fromMe is the strongest signal (even if participant is @lid)
@@ -252,7 +266,7 @@ function isSelfMessage(msg) {
   if (!msg?.key) return false;
   if (msg.key.fromMe) return true;
 
-  const sender = msg.key.participant || msg.key.remoteJid;
+  const sender = getSenderJidForMsg(msg) || msg.key.participant || msg.key.remoteJid;
   if (BOT_SELF_JID && sender === BOT_SELF_JID) return true;
 
   // if we know bot phone, match against sender
@@ -272,7 +286,9 @@ function isExempt(msg) {
   if (!msg?.key) return false;
   if (msg.key.fromMe) return true;
 
-  const senderJid = msg.key.participant || msg.key.remoteJid;
+  const senderJid = getSenderJidForMsg(msg);
+  // In groups, if participant is missing, treat as NOT exempt (never use group JID as sender identity).
+  if (!senderJid) return false;
   if (isOwnerLid(senderJid)) return true;
   if (isOwner(senderJid)) return true;
   if (BOT_SELF_JID && senderJid === BOT_SELF_JID) return true;
@@ -921,7 +937,11 @@ async function handleMessage(msg) {
         if (!msg.message) return;
 
         const groupJid = msg.key.remoteJid;
-        const senderJid = msg.key.participant || msg.key.remoteJid;
+        const senderJid = getSenderJidForMsg(msg) || msg.key.participant || msg.participant || "";
+        if (!senderJid) {
+          if (DEBUG_MODE) console.log("⚠️ Missing participant (senderJid) in group message; skipping moderation for safety");
+          return;
+        }
         const __unwrappedMsg = unwrapMessageContent(msg.message);
         const msg0 = (__unwrappedMsg === msg.message) ? msg : { ...msg, message: __unwrappedMsg };
         const visibleText = extractVisibleText(msg0).trim();
@@ -1109,7 +1129,8 @@ async function handleMessage(msg) {
     let now = null;
     try {
       groupJid = msg.key.remoteJid;
-      senderJid = msg.key.participant || msg.participant || msg.key.remoteJid;
+      senderJid = getSenderJidForMsg(msg) || msg.key.participant || msg.participant || '';
+      if (!senderJid) continue;
       senderPhone = extractPhoneNumber(senderJid);
       senderId = senderPhone || senderJid;
       rateKey = groupJid + '-' + senderId;
@@ -1179,7 +1200,8 @@ async function drainIncomingQueue() {
           // Fast path: if already flood-banned, don't waste CPU; bulk-delete via backcheck and skip handleMessage()
           try {
             const groupJid = msg.key.remoteJid;
-            const senderJid = msg.key.participant || msg.participant || msg.key.remoteJid;
+            const senderJid = getSenderJidForMsg(msg) || msg.key.participant || msg.participant || '';
+            if (!senderJid) return;
             const senderPhone = extractPhoneNumber(senderJid);
             const senderId = senderPhone || senderJid;
             const rateKey = groupJid + '-' + senderId;
