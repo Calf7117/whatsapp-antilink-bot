@@ -339,9 +339,20 @@ const LINK_DOTLIKE_REGEX = /[。．｡․∙﹒‧··・•]/g;
 const LINK_SLASHLIKE_REGEX = /[∕⁄／]/g;
 const LINK_COLONLIKE_REGEX = /[：]/g;
 // abr[.]ge / abr(dot)ge / https[:]// etc
-const LINK_BRACKET_DOT_REGEX = /[[({]s*(?:.|dot)s*[])}]/gi;
-const LINK_BRACKET_SLASH_REGEX = /[[({]s*(?:/|slash)s*[])}]/gi;
-const LINK_BRACKET_COLON_REGEX = /[[({]s*(?::|colon)s*[])}]/gi;
+// IMPORTANT: build these via RegExp constructor so even if copy/paste strips backslashes,
+// the bot won't crash with a *syntax* error at startup.
+const LINK_BRACKET_DOT_REGEX = (() => {
+  try { return new RegExp("[\[\(\{]\s*(?:\.|dot)\s*[\]\)\}]", "gi"); }
+  catch { return new RegExp("\\[\\s*(?:\\.|dot)\\s*\\]", "gi"); }
+})();
+const LINK_BRACKET_SLASH_REGEX = (() => {
+  try { return new RegExp("[\[\(\{]\s*(?:\/|slash)\s*[\]\)\}]", "gi"); }
+  catch { return new RegExp("\\[\\s*(?:\/|slash)\\s*\\]", "gi"); }
+})();
+const LINK_BRACKET_COLON_REGEX = (() => {
+  try { return new RegExp("[\[\(\{]\s*(?::|colon)\s*[\]\)\}]", "gi"); }
+  catch { return new RegExp("\\[\\s*(?::|colon)\\s*\\]", "gi"); }
+})();
 
 function normalizeForLinkDetect(text) {
   let s = String(text || "");
@@ -362,7 +373,8 @@ function _compactForLinkDetect(s) {
 }
 
 function _stripBrackets(s) {
-  return String(s || "").replace(/[[](){}<>]/g, "");
+  // Use RegExp constructor to avoid any chance of a malformed regex literal after copy/paste.
+  return String(s || "").replace(new RegExp("[\[\]\(\)\{\}<>]", "g"), "");
 }
 
 function _dehxxp(s) {
