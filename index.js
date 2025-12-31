@@ -23,6 +23,8 @@ http.createServer((req, res) => {
   res.end("Anti-Link Bot Running");
 }).listen(PORT, () => console.log("Health server on port " + PORT));
 
+console.log("🔧 Build: 2025-12-31 (link-probe-fallback + stable exemption logs)");
+
 const userViolations = new Map();
 const notAdminGroups = new Map();
 const NOT_ADMIN_CACHE_TTL = 60 * 60 * 1000;
@@ -331,22 +333,22 @@ const FAST_LINK_REGEX = new RegExp(
 );
 
 // Remove invisible/control chars used to break URLs
-const LINK_INVIS_REGEX = /[\u00AD\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\uFE00-\uFE0F\u2066-\u2069]/g;
+const LINK_INVIS_REGEX = /[­͏؜᠎​-‏‪-‮⁠-⁯﻿︀-️⁦-⁩]/g;
 // Dot-lookalikes used in obfuscation
-const LINK_DOTLIKE_REGEX = /[\u3002\uFF0E\uFF61\u2024\u2219\uFE52\u2027\u00B7\u0387\u30FB\u2022]/g;
-const LINK_SLASHLIKE_REGEX = /[\u2215\u2044\uFF0F]/g;
-const LINK_COLONLIKE_REGEX = /[\uFF1A]/g;
+const LINK_DOTLIKE_REGEX = /[。．｡․∙﹒‧··・•]/g;
+const LINK_SLASHLIKE_REGEX = /[∕⁄／]/g;
+const LINK_COLONLIKE_REGEX = /[：]/g;
 // abr[.]ge / abr(dot)ge / https[:]// etc
-const LINK_BRACKET_DOT_REGEX = /[\[\(\{]\s*(?:\.|dot)\s*[\]\)\}]/gi;
-const LINK_BRACKET_SLASH_REGEX = /[\[\(\{]\s*(?:\/|slash)\s*[\]\)\}]/gi;
-const LINK_BRACKET_COLON_REGEX = /[\[\(\{]\s*(?::|colon)\s*[\]\)\}]/gi;
+const LINK_BRACKET_DOT_REGEX = /[[({]s*(?:.|dot)s*[])}]/gi;
+const LINK_BRACKET_SLASH_REGEX = /[[({]s*(?:/|slash)s*[])}]/gi;
+const LINK_BRACKET_COLON_REGEX = /[[({]s*(?::|colon)s*[])}]/gi;
 
 function normalizeForLinkDetect(text) {
   let s = String(text || "");
   try { s = s.normalize("NFKC"); } catch {}
   return s
     .replace(LINK_INVIS_REGEX, "")
-    .replace(/[\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/g, " ")
+    .replace(/[   -     　]/g, " ")
     .replace(LINK_DOTLIKE_REGEX, ".")
     .replace(LINK_BRACKET_DOT_REGEX, ".")
     .replace(LINK_SLASHLIKE_REGEX, "/")
@@ -356,15 +358,15 @@ function normalizeForLinkDetect(text) {
 }
 
 function _compactForLinkDetect(s) {
-  return String(s || "").replace(/\s+/g, "");
+  return String(s || "").replace(/s+/g, "");
 }
 
 function _stripBrackets(s) {
-  return String(s || "").replace(/[\[\]\(\)\{\}<>]/g, "");
+  return String(s || "").replace(/[[](){}<>]/g, "");
 }
 
 function _dehxxp(s) {
-  return String(s || "").replace(/\bhxxps?:/ig, (m) => m.replace(/xx/ig, "tt"));
+  return String(s || "").replace(/hxxps?:/ig, (m) => m.replace(/xx/ig, "tt"));
 }
 
 function detectLinks(text) {
@@ -404,7 +406,7 @@ function hasLinkQuick(text) {
 
 function detectPhoneNumbers(text) {
   if (!text) return false;
-  return /\d{9,}/.test(text);
+  return /d{9,}/.test(text);
 }
 
 function isAPKFile(msg) {
@@ -446,7 +448,7 @@ function isBusinessPost(msg) {
 
   if ((!p && !c) && ext && (ext.sourceUrl || ext.mediaUrl || ext.title)) {
     const src = String(ext.sourceUrl || "");
-    if (/\b(?:wa\.me|whatsapp\.com)\/(?:catalog|c)\/?/i.test(src)) return true;
+    if (/(?:wa.me|whatsapp.com)/(?:catalog|c)/?/i.test(src)) return true;
   }
 
   if (p) {
@@ -469,7 +471,7 @@ const KEYWORDS = [
   "ksh","kes","usd","call","business","contact","message"
 ];
 
-const KEYWORDS_REGEX = new RegExp("\\b(?:" + KEYWORDS.join("|") + ")\\b", "i");
+const KEYWORDS_REGEX = new RegExp("\b(?:" + KEYWORDS.join("|") + ")\b", "i");
 
 function detectKeyword(text) {
   if (!text) return false;
@@ -899,10 +901,14 @@ async function startBot() {
           }
 
           try {
-            let responseText = "✅ ANTI-LINK BOT ACTIVE\n";
-            responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
-            responseText += "🚀 Priority queue enabled\n";
-            responseText += "💃 We R 🆗 Baby!! 🤫\n";
+            let responseText = "✅ ANTI-LINK BOT ACTIVE
+";
+            responseText += "👑 Owner: " + ADMIN_NUMBER + "
+";
+            responseText += "🚀 Priority queue enabled
+";
+            responseText += "💃 We R 🆗 Baby!! 🤫
+";
             await sock.sendMessage(groupJid, { text: responseText });
             console.log("✅ Sent !bot response");
           } catch (e) {
