@@ -859,9 +859,22 @@ function enqueueBulkViolation(groupJid, senderJid, senderId, msgKeyOrKeys, reaso
   if (typeof strikeCount === 'number') rec.strikeCount = Math.max(rec.strikeCount, strikeCount);
   if (options.forceRemove) rec.forceRemove = true;
 
-  const delay = (typeof options.delayMs === 'number') ? options.delayMs : BULK_DELAY_MS;
-  if (rec.timer) clearTimeout(rec.timer);
-  rec.timer = setTimeout(() => flushBulkViolation(key).catch(() => {}), delay);
+  // IMPORTANT: do NOT keep postponing the flush under continuous spam.
+  // We schedule the first flush and keep it (only pulling it earlier if delayMs is smaller).
+  const delay = Math.max(0, (typeof options.delayMs === 'number') ? options.delayMs : BULK_DELAY_MS);
+  const due = now + delay;
+
+  if (!rec.timer) {
+    rec.dueTs = due;
+    rec.timer = setTimeout(() => flushBulkViolation(key).catch(() => {}), Math.max(0, rec.dueTs - Date.now()));
+  } else {
+    if (!rec.dueTs) rec.dueTs = due;
+    if (due < rec.dueTs) {
+      clearTimeout(rec.timer);
+      rec.dueTs = due;
+      rec.timer = setTimeout(() => flushBulkViolation(key).catch(() => {}), Math.max(0, rec.dueTs - Date.now()));
+    }
+  }
 }
 
 async function flushBulkViolation(key) {
@@ -869,6 +882,8 @@ async function flushBulkViolation(key) {
   if (!rec) return;
   pendingActions.delete(key);
   if (rec.timer) clearTimeout(rec.timer);
+  rec.timer = null;
+  rec.dueTs = 0;
 
   const keys = _uniqueDeleteKeys(rec.msgKeys);
   if (DEBUG_MODE) {
