@@ -43,16 +43,32 @@ const FLOOD_WINDOW_MS = 3000;
 const FLOOD_MAX_MSG = 5;
 const FLOOD_BAN_TTL_MS = 60000;
 
+// Backcheck: keep a short rolling window of msg keys per sender so we can delete everything when flood-ban triggers
+const senderRecentKeys = new Map();
+const RECENT_KEY_TTL_MS = Math.max(10000, FLOOD_WINDOW_MS * 2);
+const RECENT_KEY_MAX = 80;
+
+// Retry deletes that fail under rate limiting (best-effort backchecking)
+let deleteRetryQueue = [];
+let deleteRetryTimer = null;
+const DELETE_RETRY_MAX_ATTEMPTS = 6;
+const DELETE_RETRY_MAX_AGE_MS = 5 * 60 * 1000;
+
 // 3) Bulk moderation: buffer deletes/removal per sender to reduce API churn under flood
 const pendingActions = new Map();
 const BULK_DELAY_MS = 600;
 const DELETE_PARALLEL = 6;
 
 // 2) Optimized queue processing: drain in parallel batches with a hard concurrency limit
-const incomingQueue = [];
+// Priority queues: link-like messages are processed first to reduce 'slip-through' during floods
+const incomingQueueHi = [];
+const incomingQueueLo = [];
 let drainingQueue = false;
 const QUEUE_BATCH_SIZE = 25;
 const QUEUE_PARALLEL = 8;
+// Yielding: keep event-loop responsive; go to 0ms under big backlog
+const QUEUE_YIELD_IDLE_MS = 10;
+const QUEUE_YIELD_BUSY_MS = 0;
 
 let hasConnectedBefore = false;
 
@@ -264,11 +280,72 @@ function isExempt(msg) {
 }
 
 // Fast path: single precompiled regex for speed during heavy load
+// NOTE: We normalize common obfuscation characters (zero-width + unicode dot/slash/colon) before testing.
 const FAST_LINK_REGEX = /(?:https?:\/\/|www\.)\S+|\b(?:wa\.me|whatsapp\.com)\/\S+|\b[A-Za-z0-9-]{1,63}\.(?:com|net|org|io|co|me|app|tech|info|biz|store|online|ly|ge|ke|uk|us|tv|gg|site|blog|news|vip|link)(?:\/\S*)?\b/i;
+// Remove invisible/control chars often used to break URLs (zero-width, soft hyphen, direction marks)
+// Expanded set includes: word-joiner, variation selectors, combining grapheme joiner, bidi isolates, etc.
+const LINK_INVIS_REGEX = /[\u00AD\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\uFE00-\uFE0F\uE0000-\uE007F\u2066-\u2069]/g;
+// Includes common dot-lookalikes used by spammers: fullwidth dot, ideographic dot, middle dot, bullet, etc.
+const LINK_DOTLIKE_REGEX = /[\u3002\uFF0E\uFF61\u2024\u2219\uFE52\u2027\u00B7\u0387\u30FB\u2022]/g;
+const LINK_SLASHLIKE_REGEX = /[\u2215\u2044\uFF0F]/g;
+const LINK_COLONLIKE_REGEX = /[\uFF1A]/g;
+// Handle common textual obfuscations like: abr[.]ge  abr(dot)ge  https[:]//
+const LINK_BRACKET_DOT_REGEX = /[\[\(\{]\s*(?:\.|dot)\s*[\]\)\}]/gi;
+const LINK_BRACKET_SLASH_REGEX = /[\[\(\{]\s*(?:\/|slash)\s*[\]\)\}]/gi;
+const LINK_BRACKET_COLON_REGEX = /[\[\(\{]\s*(?::|colon)\s*[\]\)\}]/gi;
+
+function normalizeForLinkDetect(text) {
+  let s = String(text || '');
+  // NFKC reduces lookalike forms (fullwidth chars, compatibility chars) used in obfuscation
+  try { s = s.normalize('NFKC'); } catch {}
+  return s
+    .replace(LINK_INVIS_REGEX, '')
+    // Normalize exotic whitespace to regular spaces, then let callers optionally compact
+    .replace(/[\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/g, ' ')
+    .replace(LINK_DOTLIKE_REGEX, '.')
+    .replace(LINK_BRACKET_DOT_REGEX, '.')
+    .replace(LINK_SLASHLIKE_REGEX, '/')
+    .replace(LINK_BRACKET_SLASH_REGEX, '/')
+    .replace(LINK_COLONLIKE_REGEX, ':')
+    .replace(LINK_BRACKET_COLON_REGEX, ':');
+}
+
+// Extra safety: catch cases where the protocol separators are split (e.g. h t t p : / /)
+function _compactForLinkDetect(s) {
+  return String(s || '').replace(/\s+/g, '');
+}
+
+function _stripBrackets(s) {
+  return String(s || '').replace(/[\[\]\(\)\{\}<>]/g, '');
+}
+
+function _dehxxp(s) {
+  return String(s || '').replace(/\bhxxps?:/ig, (m) => m.replace(/xx/ig, 'tt'));
+}
+
 
 function detectLinks(text) {
   if (!text) return false;
-  return FAST_LINK_REGEX.test(text);
+  const t0 = normalizeForLinkDetect(text);
+  if (FAST_LINK_REGEX.test(t0)) return true;
+
+  // Fallback 1: spaced/line-broken links
+  const t1 = _compactForLinkDetect(t0);
+  if (t1 !== t0 && FAST_LINK_REGEX.test(t1)) return true;
+
+  // Fallback 2: remove surrounding brackets frequently used with [.] or (dot)
+  const t2 = _stripBrackets(t1);
+  if (t2 !== t1 && FAST_LINK_REGEX.test(t2)) return true;
+
+  // Fallback 3: common scheme obfuscation hxxp(s) => http(s)
+  const t3 = _dehxxp(t2);
+  if (t3 !== t2 && FAST_LINK_REGEX.test(t3)) return true;
+
+  // Fallback 4: extra aggressive compact after dehxxp
+  const t4 = _compactForLinkDetect(t3);
+  if (t4 !== t3 && FAST_LINK_REGEX.test(t4)) return true;
+
+  return false;
 }
 
 function detectPhoneNumbers(text) {
@@ -352,6 +429,9 @@ function extractTextFromContent(content) {
 
   push(content.conversation);
   push(content.extendedTextMessage?.text);
+  push(content.extendedTextMessage?.canonicalUrl);
+  push(content.extendedTextMessage?.matchedText);
+  push(content.extendedTextMessage?.description);
   push(content.imageMessage?.caption);
   push(content.videoMessage?.caption);
   push(content.documentMessage?.caption);
@@ -414,6 +494,23 @@ function extractVisibleText(msg) {
   catch { return ""; }
 }
 
+function unwrapMessageContent(message) {
+  let m = message;
+  // Unwrap common Baileys wrappers so downstream checks see the real payload.
+  for (let i = 0; i < 8; i++) {
+    if (!m || typeof m !== 'object') break;
+    if (m.ephemeralMessage?.message) { m = m.ephemeralMessage.message; continue; }
+    if (m.viewOnceMessage?.message) { m = m.viewOnceMessage.message; continue; }
+    if (m.viewOnceMessageV2?.message) { m = m.viewOnceMessageV2.message; continue; }
+    if (m.viewOnceMessageV2Extension?.message) { m = m.viewOnceMessageV2Extension.message; continue; }
+    if (m.documentWithCaptionMessage?.message) { m = m.documentWithCaptionMessage.message; continue; }
+    if (m.deviceSentMessage?.message) { m = m.deviceSentMessage.message; continue; }
+    if (m.editedMessage?.message) { m = m.editedMessage.message; continue; }
+    break;
+  }
+  return m || {};
+}
+
 function hasButtons(msg) {
   const m = msg.message || {};
   return !!(m.buttonsMessage || m.templateMessage || m.listMessage || m.interactiveMessage);
@@ -467,12 +564,21 @@ function cleanupCaches() {
     if (pruned.length) senderRate.set(k, pruned);
     else senderRate.delete(k);
   }
+  // Also drop flood-ban state once TTL expires (handled below)
   for (const [k, ts] of floodBanned.entries()) {
     if ((now - ts) > FLOOD_BAN_TTL_MS) floodBanned.delete(k);
+  }
+  for (const [k, arr] of senderRecentKeys.entries()) {
+    const pruned = (arr || []).filter((x) => x && x.ts && (now - x.ts) < RECENT_KEY_TTL_MS);
+    if (pruned.length) senderRecentKeys.set(k, pruned.slice(-RECENT_KEY_MAX));
+    else senderRecentKeys.delete(k);
   }
   for (const [k, rec] of pendingActions.entries()) {
     if (!rec || !rec.lastTs) { pendingActions.delete(k); continue; }
     if ((now - rec.lastTs) > 5 * 60 * 1000) pendingActions.delete(k);
+  }
+  if (Array.isArray(deleteRetryQueue) && deleteRetryQueue.length) {
+    deleteRetryQueue = deleteRetryQueue.filter((x) => x && (now - (x.firstTs || now)) < DELETE_RETRY_MAX_AGE_MS && (x.attempt || 0) <= DELETE_RETRY_MAX_ATTEMPTS);
   }
 }
 
@@ -638,11 +744,33 @@ async function startBot() {
       }
     }
 
-    function _uniqueDeleteKeys(msgKeys) {
+    function rememberSenderKey(rateKey, msgKey) {
+  try {
+    if (!rateKey || !msgKey) return;
+    const now = Date.now();
+    const arr = senderRecentKeys.get(rateKey) || [];
+    arr.push({ ts: now, key: msgKey });
+    if (arr.length > RECENT_KEY_MAX) arr.splice(0, arr.length - RECENT_KEY_MAX);
+    senderRecentKeys.set(rateKey, arr);
+  } catch {}
+}
+
+function getRecentSenderKeys(rateKey) {
+  try {
+    const now = Date.now();
+    const arr = senderRecentKeys.get(rateKey) || [];
+    const pruned = (arr || []).filter((x) => x && x.ts && (now - x.ts) < RECENT_KEY_TTL_MS);
+    if (pruned.length) senderRecentKeys.set(rateKey, pruned.slice(-RECENT_KEY_MAX));
+    else senderRecentKeys.delete(rateKey);
+    return pruned.map((x) => x.key);
+  } catch { return []; }
+}
+
+function _uniqueDeleteKeys(msgKeys) {
   const seen = new Set();
   const out = [];
   for (const k of (msgKeys || [])) {
-    const id = k?.id || (k?.remoteJid ? (k.remoteJid + ':' + (k.participant || '') + ':' + (k.id || '')) : '');
+    const id = k?.remoteJid ? (k.remoteJid + ':' + (k.participant || '') + ':' + (k.id || '')) : (k?.id || '');
     const dedupeKey = id || JSON.stringify(k);
     if (seen.has(dedupeKey)) continue;
     seen.add(dedupeKey);
@@ -651,7 +779,50 @@ async function startBot() {
   return out;
 }
 
-function enqueueBulkViolation(groupJid, senderJid, senderId, msgKey, reasons, strikeCount, options = {}) {
+function enqueueDeleteRetry(groupJid, msgKey, attempt = 1) {
+  try {
+    if (!groupJid || !msgKey) return;
+    if (attempt > DELETE_RETRY_MAX_ATTEMPTS) return;
+    const now = Date.now();
+    const id = groupJid + ':' + (msgKey.participant || '') + ':' + (msgKey.id || '');
+    if (deleteRetryQueue.some((x) => x && x.id === id)) return;
+    deleteRetryQueue.push({ id, groupJid, msgKey, attempt, firstTs: now, nextTs: now + Math.min(15000, 1200 * attempt) });
+    if (!deleteRetryTimer) deleteRetryTimer = setTimeout(() => drainDeleteRetryQueue().catch(() => {}), 800);
+  } catch {}
+}
+
+async function drainDeleteRetryQueue() {
+  const now = Date.now();
+  deleteRetryTimer = null;
+
+  // drop old/over-attempt items
+  deleteRetryQueue = (deleteRetryQueue || []).filter((x) => x && (now - (x.firstTs || now)) < DELETE_RETRY_MAX_AGE_MS && (x.attempt || 0) <= DELETE_RETRY_MAX_ATTEMPTS);
+  if (!deleteRetryQueue.length) return;
+
+  deleteRetryQueue.sort((a, b) => (a.nextTs || 0) - (b.nextTs || 0));
+  const ready = deleteRetryQueue.filter((x) => (x.nextTs || 0) <= now);
+  const pending = deleteRetryQueue.filter((x) => (x.nextTs || 0) > now);
+  deleteRetryQueue = pending;
+
+  const PAR = Math.max(1, Math.floor(DELETE_PARALLEL / 2));
+  for (let i = 0; i < ready.length; i += PAR) {
+    const slice = ready.slice(i, i + PAR);
+    const results = await Promise.allSettled(slice.map((it) => safeDelete(it.groupJid, it.msgKey)));
+    results.forEach((r, idx) => {
+      const it = slice[idx];
+      const ok = (r.status === 'fulfilled') && r.value === true;
+      if (!ok) enqueueDeleteRetry(it.groupJid, it.msgKey, (it.attempt || 1) + 1);
+    });
+    await new Promise(r => setTimeout(r, 120));
+  }
+
+  if (deleteRetryQueue.length) {
+    const nextIn = Math.max(400, Math.min(...deleteRetryQueue.map((x) => Math.max(0, (x.nextTs || 0) - Date.now()))));
+    deleteRetryTimer = setTimeout(() => drainDeleteRetryQueue().catch(() => {}), nextIn);
+  }
+}
+
+function enqueueBulkViolation(groupJid, senderJid, senderId, msgKeyOrKeys, reasons, strikeCount, options = {}) {
   const key = groupJid + '-' + senderId;
   const now = Date.now();
 
@@ -666,7 +837,8 @@ function enqueueBulkViolation(groupJid, senderJid, senderId, msgKey, reasons, st
   rec.senderId = senderId;
   rec.lastTs = now;
 
-  if (msgKey) rec.msgKeys.push(msgKey);
+  const keys = Array.isArray(msgKeyOrKeys) ? msgKeyOrKeys : (msgKeyOrKeys ? [msgKeyOrKeys] : []);
+  if (keys.length) rec.msgKeys.push(...keys);
   for (const r of (reasons || [])) {
     rec.reasons.set(r, (rec.reasons.get(r) || 0) + 1);
   }
@@ -694,8 +866,15 @@ async function flushBulkViolation(key) {
 
   for (let i = 0; i < keys.length; i += DELETE_PARALLEL) {
     const slice = keys.slice(i, i + DELETE_PARALLEL);
-    await Promise.allSettled(slice.map((k) => safeDelete(rec.groupJid, k)));
+    const results = await Promise.allSettled(slice.map((k) => safeDelete(rec.groupJid, k)));
+    results.forEach((r, idx) => {
+      const ok = (r.status === 'fulfilled') && r.value === true;
+      if (!ok) enqueueDeleteRetry(rec.groupJid, slice[idx], 1);
+    });
   }
+
+  // kick retry sweeper (if needed)
+  if (deleteRetryQueue.length && !deleteRetryTimer) deleteRetryTimer = setTimeout(() => drainDeleteRetryQueue().catch(() => {}), 800);
 
   if (rec.forceRemove || rec.strikeCount >= 3) {
     await new Promise(r => setTimeout(r, 200));
@@ -703,6 +882,8 @@ async function flushBulkViolation(key) {
     if (removed) {
       const userKey = rec.groupJid + '-' + rec.senderId;
       userViolations.delete(userKey);
+      senderRate.delete(userKey);
+      senderRecentKeys.delete(userKey);
     }
   }
 }
@@ -713,7 +894,9 @@ async function handleMessage(msg) {
 
         const groupJid = msg.key.remoteJid;
         const senderJid = msg.key.participant || msg.key.remoteJid;
-        const visibleText = extractVisibleText(msg).trim();
+        const __unwrappedMsg = unwrapMessageContent(msg.message);
+        const msg0 = (__unwrappedMsg === msg.message) ? msg : { ...msg, message: __unwrappedMsg };
+        const visibleText = extractVisibleText(msg0).trim();
         const textLower = visibleText.toLowerCase();
 
         // !bot command (keep your preferred format, no version)
@@ -785,31 +968,52 @@ async function handleMessage(msg) {
         // ===== NOT OWNER - CHECK FOR VIOLATIONS =====
 
 
-        // ===== PRIORITY: SENDER-BASED FLOOD BAN (anti-spam) =====
-        // If a sender exceeds FLOOD_MAX_MSG in FLOOD_WINDOW_MS, schedule immediate remove and bulk-delete their spam.
+        // ===== PRIORITY: EARLY LINK CHECK (fast path during floods) =====
+        // If a message contains a link, act immediately (bulk-delete/remove) and skip heavier checks.
+        // This reduces the chance that link spam slips through while the bot is under load.
+        try {
+          const earlyLink = detectLinks(visibleText);
+          if (earlyLink) {
+            const senderId0 = senderPhone || senderJid;
+            const rateKey0 = groupJid + '-' + senderId0;
+            rememberSenderKey(rateKey0, msg.key);
+            const userKey0 = rateKey0;
+            const current0 = userViolations.get(userKey0) || 0;
+            const updated0 = current0 + 1;
+            userViolations.set(userKey0, updated0);
+            enqueueBulkViolation(groupJid, senderJid, senderId0, msg.key, ['link'], updated0, { forceRemove: updated0 >= 3 });
+            return;
+          }
+        } catch {}
+
+
+        // ===== PRIORITY: SENDER-BASED FLOOD BAN (anti-spam + backcheck) =====
+        // Backcheck idea: once threshold trips, we delete ALL recent keys for that sender (even if some messages were still waiting in the queue).
         const senderId = senderPhone || senderJid;
         const rateKey = groupJid + '-' + senderId;
         const now = Date.now();
 
+        // Ensure current key is in the backcheck window (even if enqueue hook missed it)
+        rememberSenderKey(rateKey, msg.key);
 
         const bannedAt = floodBanned.get(rateKey);
         if (bannedAt && (now - bannedAt) < FLOOD_BAN_TTL_MS) {
-          enqueueBulkViolation(groupJid, senderJid, senderId, msg.key, ['flood-ban'], 3, { forceRemove: true, delayMs: 0 });
+          const backKeys = getRecentSenderKeys(rateKey);
+          enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood-ban'], 3, { forceRemove: true, delayMs: 0 });
           return;
         }
 
-
         const arr = senderRate.get(rateKey) || [];
         const pruned = arr.filter((ts) => (now - ts) < FLOOD_WINDOW_MS);
-        pruned.push(now);
+        // NOTE: we increment senderRate at message ingest time (messages.upsert) to catch floods even if processing lags.
         senderRate.set(rateKey, pruned);
-
 
         if (pruned.length > FLOOD_MAX_MSG) {
           floodBanned.set(rateKey, now);
           userViolations.set(rateKey, 3);
           console.log('🚨 FLOOD-BAN: ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
-          enqueueBulkViolation(groupJid, senderJid, senderId, msg.key, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, { forceRemove: true, delayMs: 0 });
+          const backKeys = getRecentSenderKeys(rateKey);
+          enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, { forceRemove: true, delayMs: 0 });
           return;
         }
 
@@ -817,13 +1021,13 @@ async function handleMessage(msg) {
         const dup = checkDuplicate(groupJid, senderJid, visibleText);
         const hasLink = detectLinks(visibleText);
         const hasPhone = detectPhoneNumbers(visibleText);
-        const business = isBusinessPost(msg);
-        const apk = isAPKFile(msg);
-        const zip = isZipFile(msg);
-        const audio = isAudioFile(msg);
+        const business = isBusinessPost(msg0);
+        const apk = isAPKFile(msg0);
+        const zip = isZipFile(msg0);
+        const audio = isAudioFile(msg0);
         const keyword = detectKeyword(visibleText);
-        const buttons = hasButtons(msg);
-        const contact = isContactMessage(msg);
+        const buttons = hasButtons(msg0);
+        const contact = isContactMessage(msg0);
 
         const violated = dup.isDuplicate || hasLink || hasPhone || business || apk || zip || audio || keyword || buttons || contact;
         if (!violated) return;
@@ -867,7 +1071,61 @@ async function handleMessage(msg) {
   for (const msg of (msgs || [])) {
     if (!msg?.key?.remoteJid?.endsWith('@g.us')) continue;
     if (!msg.message) continue;
-    incomingQueue.push(msg);
+
+    // Backcheck + PRIORITY flood-ban at ingest time (before queueing) to prevent queue blowups/hangs
+    let groupJid = null;
+    let senderJid = null;
+    let senderPhone = null;
+    let senderId = null;
+    let rateKey = null;
+    let now = null;
+    try {
+      groupJid = msg.key.remoteJid;
+      senderJid = msg.key.participant || msg.participant || msg.key.remoteJid;
+      senderPhone = extractPhoneNumber(senderJid);
+      senderId = senderPhone || senderJid;
+      rateKey = groupJid + '-' + senderId;
+      now = Date.now();
+
+      rememberSenderKey(rateKey, msg.key);
+
+      // Never rate-limit/remove exempt messages (owner/self/fromMe)
+      if (!isExempt(msg)) {
+        const bannedAt = floodBanned.get(rateKey);
+        if (bannedAt && (now - bannedAt) < FLOOD_BAN_TTL_MS) {
+          const backKeys = getRecentSenderKeys(rateKey);
+          enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood-ban'], 3, { forceRemove: true, delayMs: 0 });
+          continue;
+        }
+
+        const arr = senderRate.get(rateKey) || [];
+        const pruned = arr.filter((ts) => (now - ts) < FLOOD_WINDOW_MS);
+        pruned.push(now);
+        senderRate.set(rateKey, pruned);
+
+        if (pruned.length > FLOOD_MAX_MSG) {
+          floodBanned.set(rateKey, now);
+          userViolations.set(rateKey, 3);
+          console.log('🚨 FLOOD-BAN(ingest): ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
+          const backKeys = getRecentSenderKeys(rateKey);
+          enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, { forceRemove: true, delayMs: 0 });
+          continue;
+        }
+      }
+    } catch {}
+
+    // Link-priority enqueue: attempt a lightweight link signal from extracted visible text
+    // (unwrap wrappers + use the patched detectLinks). If anything fails, default to low queue.
+    let hi = false;
+    try {
+      const __unwrapped = (typeof unwrapMessageContent === 'function') ? unwrapMessageContent(msg.message) : msg.message;
+      const msg0 = (__unwrapped === msg.message) ? msg : { ...msg, message: __unwrapped };
+      const t = extractVisibleText(msg0);
+      hi = !!(t && detectLinks(t));
+    } catch { hi = false; }
+
+    if (hi) incomingQueueHi.push(msg);
+    else incomingQueueLo.push(msg);
   }
   if (!drainingQueue) {
     drainingQueue = true;
@@ -876,18 +1134,47 @@ async function handleMessage(msg) {
   }
 }
 
+function _queueLen() { return (incomingQueueHi.length + incomingQueueLo.length); }
+
 async function drainIncomingQueue() {
   try {
-    while (incomingQueue.length) {
-      const batch = incomingQueue.splice(0, QUEUE_BATCH_SIZE);
+    while (_queueLen()) {
+      // Always consume from high-priority first
+      const batch = [];
+      while (batch.length < QUEUE_BATCH_SIZE && incomingQueueHi.length) batch.push(incomingQueueHi.shift());
+      while (batch.length < QUEUE_BATCH_SIZE && incomingQueueLo.length) batch.push(incomingQueueLo.shift());
+      if (!batch.length) break;
+
       for (let i = 0; i < batch.length; i += QUEUE_PARALLEL) {
         const slice = batch.slice(i, i + QUEUE_PARALLEL);
-        await Promise.allSettled(slice.map((msg) => handleMessage(msg)));
+        await Promise.allSettled(slice.map(async (msg) => {
+          // Fast path: if already flood-banned, don't waste CPU; bulk-delete via backcheck and skip handleMessage()
+          try {
+            const groupJid = msg.key.remoteJid;
+            const senderJid = msg.key.participant || msg.participant || msg.key.remoteJid;
+            const senderPhone = extractPhoneNumber(senderJid);
+            const senderId = senderPhone || senderJid;
+            const rateKey = groupJid + '-' + senderId;
+            const bannedAt = floodBanned.get(rateKey);
+            if (bannedAt && (Date.now() - bannedAt) < FLOOD_BAN_TTL_MS) {
+              rememberSenderKey(rateKey, msg.key);
+              const backKeys = getRecentSenderKeys(rateKey);
+              enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood-ban'], 3, { forceRemove: true, delayMs: 0 });
+              return;
+            }
+          } catch {}
+          return handleMessage(msg);
+        }));
+
+        // Adaptive yield: 0ms when backlog high, 10ms otherwise
+        const backlog = _queueLen();
+        const yieldMs = backlog >= (QUEUE_BATCH_SIZE * 4) ? QUEUE_YIELD_BUSY_MS : QUEUE_YIELD_IDLE_MS;
+        if (yieldMs > 0) await new Promise(r => setTimeout(r, yieldMs));
       }
     }
   } finally {
     drainingQueue = false;
-    if (incomingQueue.length) {
+    if (_queueLen()) {
       drainingQueue = true;
       setTimeout(drainIncomingQueue, 0);
     }
