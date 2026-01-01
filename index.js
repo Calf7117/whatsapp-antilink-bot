@@ -25,7 +25,7 @@ http.createServer((req, res) => {
   res.end("Anti-Link Bot Running");
 }).listen(PORT, () => console.log("Health server on port " + PORT));
 
-console.log("\ud83d\udd27 Build: 2025-12-31 (readd-fix + decrypt-harden + safe-regexp + diag-logs)");
+console.log("🔧 Build: 2025-12-31 (readd-fix + decrypt-harden + safe-regexp + diag-logs)");
 
 // IMPORTANT CHANGE:
 // Track strikes by normalized phone (not raw JID) so device-variants don't create new strike buckets.
@@ -132,7 +132,7 @@ function _ts() {
 function _snip(s, n = 140) {
   const t = String(s || "");
   if (t.length <= n) return t;
-  return t.slice(0, n) + "\u2026";
+  return t.slice(0, n) + "…";
 }
 
 function _msgKeyInfo(msgKey) {
@@ -173,6 +173,7 @@ function encrypt(text) {
   }
 }
 
+// FIX: Harden decrypt to prevent Render env whitespace/quotes/truncation from crashing Buffer/crypto.
 function decrypt(text) {
   try {
     let raw = String(text || "");
@@ -228,6 +229,7 @@ function decrypt(text) {
     let decrypted = decipher.update(encryptedHex, "hex", "utf8");
     decrypted += decipher.final("utf8");
 
+    // If decrypt succeeded, env session is valid.
     SESSION_ENV_STATUS = "valid";
     SESSION_ENV_REASON = "";
     return decrypted;
@@ -243,6 +245,7 @@ function restoreSessionFromEnv() {
   try {
     const encrypted = process.env.WHATSAPP_SESSION;
 
+    // Validate env session without decrypting (lets us warn on truncation even if we skip restore).
     if (encrypted) {
       const v = validateSessionEnv(encrypted);
       if (v.ok) {
@@ -257,27 +260,38 @@ function restoreSessionFromEnv() {
       SESSION_ENV_REASON = 'WHATSAPP_SESSION not set';
     }
 
+    // If local auth exists, don't overwrite it.
+    // But do warn (once) if env is invalid/truncated, so you can fix pair-once persistence.
     if (localAuthExists()) {
       if (!restoreSessionFromEnv._warned && SESSION_ENV_STATUS === 'invalid') {
         restoreSessionFromEnv._warned = true;
-        console.log('\u26a0\ufe0f WHATSAPP_SESSION env appears INVALID (' + (SESSION_ENV_REASON || 'unknown') + '). Using local auth files; please update env to avoid future re-pairing.');
+        console.log('⚠️ WHATSAPP_SESSION env appears INVALID (' + (SESSION_ENV_REASON || 'unknown') + '). Using local auth files; please update env to avoid future re-pairing.');
       } else {
-        console.log("\u2139\ufe0f Local auth files found; skipping env restore");
+        console.log("ℹ️ Local auth files found; skipping env restore");
       }
       return true;
     }
 
     if (!encrypted) {
-      console.log("\u2139\ufe0f No saved session found in environment variables");
+      console.log("ℹ️ No saved session found in environment variables");
       return false;
     }
 
-    console.log("\ud83d\udd04 Restoring session from environment variable...");
+    // If env session is known-invalid, do not attempt crypto decrypt repeatedly.
+    // We'll continue with pairing/local auth as applicable.
+    if (SESSION_ENV_STATUS === 'invalid') {
+      console.log("❌ WHATSAPP_SESSION env is invalid (" + (SESSION_ENV_REASON || 'unknown') + ") - skipping restore");
+      console.log("🧩 Likely causes: (1) WHATSAPP_SESSION value is truncated/corrupted, or (2) SESSION_KEY changed since session was generated.");
+      console.log("✅ Fix: replace WHATSAPP_SESSION with the newly printed one (if shown), OR restore the original SESSION_KEY.");
+      return false;
+    }
+
+    console.log("🔄 Restoring session from environment variable...");
     const decrypted = decrypt(encrypted);
     if (!decrypted) {
-      console.log("\u274c Failed to decrypt session");
-      console.log("\ud83e\udde9 Likely causes: (1) WHATSAPP_SESSION value is truncated/corrupted, or (2) SESSION_KEY changed since session was generated.");
-      console.log("\u2705 Fix: restore the original SESSION_KEY, OR delete WHATSAPP_SESSION env var to force a fresh pairing, then redeploy.");
+      console.log("❌ Failed to decrypt session");
+      console.log("🧩 Likely causes: (1) WHATSAPP_SESSION value is truncated/corrupted, or (2) SESSION_KEY changed since session was generated.");
+      console.log("✅ Fix: restore the original SESSION_KEY, OR delete WHATSAPP_SESSION env var to force a fresh pairing, then redeploy.");
       return false;
     }
 
@@ -289,18 +303,21 @@ function restoreSessionFromEnv() {
       fs.writeFileSync(filePath, JSON.stringify(content, null, 2));
     }
 
-    console.log("\u2705 Session restored successfully!");
+    console.log("✅ Session restored successfully!");
     return true;
   } catch (error) {
     SESSION_ENV_STATUS = "invalid";
     SESSION_ENV_REASON = "restore error: " + String(error?.message || error);
-    console.log("\u274c Error restoring session:", error.message);
+    console.log("❌ Error restoring session:", error.message);
     return false;
   }
 }
 
 function saveSessionToEnv() {
   try {
+    // Pair-once behavior:
+    // - If WHATSAPP_SESSION env is present AND decrypt validated it as "valid", do not print again.
+    // - If WHATSAPP_SESSION env is present BUT invalid/truncated, we DO print a fresh valid value once.
     const hasEnv = !!(process.env.WHATSAPP_SESSION && String(process.env.WHATSAPP_SESSION).trim().length > 40);
     if (hasEnv && SESSION_ENV_STATUS === 'valid') return;
 
@@ -325,26 +342,26 @@ function saveSessionToEnv() {
 
     console.log("");
     console.log("=".repeat(60));
-    console.log("\ud83d\udcc1 COPY THIS SESSION DATA TO RENDER ENVIRONMENT VARIABLE:");
+    console.log("📁 COPY THIS SESSION DATA TO RENDER ENVIRONMENT VARIABLE:");
     console.log("=".repeat(60));
     console.log("VARIABLE NAME: WHATSAPP_SESSION");
     console.log("VARIABLE VALUE:");
     console.log(encrypted);
 
     if (SESSION_ENV_STATUS === 'invalid') {
-      console.log("\u26a0\ufe0f NOTE: Your current WHATSAPP_SESSION env looks INVALID (" + (SESSION_ENV_REASON || 'unknown') + ").");
-      console.log("\u2705 Replace WHATSAPP_SESSION in Render with the value above, then Save + Deploy.");
+      console.log("⚠️ NOTE: Your current WHATSAPP_SESSION env looks INVALID (" + (SESSION_ENV_REASON || 'unknown') + ").");
+      console.log("✅ Replace WHATSAPP_SESSION in Render with the value above, then Save + Deploy.");
     }
 
     saveSessionToEnv._shown = true;
     console.log("=".repeat(60));
-    console.log("1. Go to Render Dashboard \u2192 Your Service \u2192 Environment");
+    console.log("1. Go to Render Dashboard → Your Service → Environment");
     console.log("2. Add/Update Environment Variable: WHATSAPP_SESSION");
     console.log("3. Paste the value above");
     console.log("=".repeat(60));
     console.log("");
   } catch (error) {
-    console.log("\u274c Error saving session:", error.message);
+    console.log("❌ Error saving session:", error.message);
   }
 }
 
@@ -377,6 +394,9 @@ function jidMatchesNumber(senderJid, phoneDigits) {
 }
 
 function isOwner(senderJid) {
+  // Deterministic owner check (phone-based):
+  // - ADMIN_NUMBER: your number
+  // - BOT_SELF_PHONE: the phone number of the WhatsApp account the bot is logged into
   if (jidMatchesNumber(senderJid, ADMIN_NUMBER)) return true;
   if (BOT_SELF_PHONE && jidMatchesNumber(senderJid, BOT_SELF_PHONE)) return true;
   return false;
@@ -397,6 +417,7 @@ function getSenderJidForMsg(msg) {
   try {
     if (!msg?.key) return "";
     const remote = String(msg.key.remoteJid || "");
+    // For group messages, ONLY msg.key.participant identifies the sender. Never fall back to the group JID.
     if (remote.endsWith("@g.us")) return String(msg.key.participant || "");
     return remote;
   } catch { return ""; }
@@ -419,6 +440,7 @@ function isExempt(msg) {
   if (msg.key.fromMe) return true;
 
   const senderJid = getSenderJidForMsg(msg);
+  // In groups, if participant is missing, treat as NOT exempt.
   if (!senderJid) return false;
 
   if (isOwnerLid(senderJid)) return true;
@@ -429,23 +451,25 @@ function isExempt(msg) {
   return false;
 }
 
+// Fast path: single precompiled regex for speed during heavy load
 const FAST_LINK_REGEX = /(?:https?:\/\/|www\.)\S+|\b(?:wa\.me|whatsapp\.com)\/\S+|\b[A-Za-z0-9-]{1,63}\.(?:com|net|org|io|co|me|app|tech|info|biz|store|online|ly|ge|ke|uk|us|tv|gg|site|blog|news|vip|link)(?:\/\S*)?\b/i;
 const LINK_INVIS_REGEX = /[\u00AD\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\uFE00-\uFE0F\uE0000-\uE007F\u2066-\u2069]/g;
 const LINK_DOTLIKE_REGEX = /[\u3002\uFF0E\uFF61\u2024\u2219\uFE52\u2027\u00B7\u0387\u30FB\u2022]/g;
 const LINK_SLASHLIKE_REGEX = /[\u2215\u2044\uFF0F]/g;
 const LINK_COLONLIKE_REGEX = /[\uFF1A]/g;
 
+// IMPORTANT: build these via RegExp constructor so copy/paste can't break startup.
 const LINK_BRACKET_DOT_REGEX = (() => {
   try { return new RegExp("[\\[\\(\\{]\\s*(?:\\.|dot)\\s*[\\]\\)\\}]", "gi"); }
   catch { return new RegExp("\\\\[\\\\s*(?:\\\\.|dot)\\\\s*\\\\]", "gi"); }
 })();
 const LINK_BRACKET_SLASH_REGEX = (() => {
   try { return new RegExp("[\\[\\(\\{]\\s*(?:\\/|slash)\\s*[\\]\\)\\}]", "gi"); }
-  catch { return new RegExp("\\\\[\\\\s*(?:\\/|slash)\\s*\\\\]", "gi"); }
+  catch { return new RegExp("\\\\[\\\\s*(?:\\/|slash)\\\\s*\\\\]", "gi"); }
 })();
 const LINK_BRACKET_COLON_REGEX = (() => {
   try { return new RegExp("[\\[\\(\\{]\\s*(?::|colon)\\s*[\\]\\)\\}]", "gi"); }
-  catch { return new RegExp("\\\\[\\\\s*(?::|colon)\\s*\\\\]", "gi"); }
+  catch { return new RegExp("\\\\[\\\\s*(?::|colon)\\\\s*\\\\]", "gi"); }
 })();
 
 function normalizeForLinkDetect(text) {
@@ -477,24 +501,30 @@ function _dehxxp(s) {
 function detectLinks(text) {
   if (!text) return false;
 
+  // Normalize obfuscation first
   const t0 = normalizeForLinkDetect(text);
   const lc0 = t0.toLowerCase();
 
+  // Ultra-fast fallback (no regex): catches cases like "www.google.com" even if regex got corrupted elsewhere.
   if (lc0.includes('http://') || lc0.includes('https://') || lc0.includes('www.')) return true;
 
   if (FAST_LINK_REGEX.test(t0)) return true;
 
+  // Fallback 1: spaced/line-broken links
   const t1 = _compactForLinkDetect(t0);
   const lc1 = t1.toLowerCase();
   if (lc1.includes('http://') || lc1.includes('https://') || lc1.includes('www.')) return true;
   if (t1 !== t0 && FAST_LINK_REGEX.test(t1)) return true;
 
+  // Fallback 2: remove brackets
   const t2 = _stripBrackets(t1);
   if (t2 !== t1 && FAST_LINK_REGEX.test(t2)) return true;
 
+  // Fallback 3: hxxp(s)
   const t3 = _dehxxp(t2);
   if (t3 !== t2 && FAST_LINK_REGEX.test(t3)) return true;
 
+  // Fallback 4: aggressive compact after dehxxp
   const t4 = _compactForLinkDetect(t3);
   if (t4 !== t3 && FAST_LINK_REGEX.test(t4)) return true;
 
@@ -732,232 +762,6 @@ function cleanupCaches() {
   }
 }
 
-function rememberSenderKey(rateKey, msgKey) {
-  try {
-    if (!rateKey || !msgKey) return;
-    const now = Date.now();
-    const arr = senderRecentKeys.get(rateKey) || [];
-    arr.push({ ts: now, key: msgKey });
-    if (arr.length > RECENT_KEY_MAX) arr.splice(0, arr.length - RECENT_KEY_MAX);
-    senderRecentKeys.set(rateKey, arr);
-  } catch {}
-}
-
-function getRecentSenderKeys(rateKey) {
-  try {
-    const now = Date.now();
-    const arr = senderRecentKeys.get(rateKey) || [];
-    const pruned = (arr || []).filter((x) => x && x.ts && (now - x.ts) < RECENT_KEY_TTL_MS);
-    if (pruned.length) senderRecentKeys.set(rateKey, pruned.slice(-RECENT_KEY_MAX));
-    else senderRecentKeys.delete(rateKey);
-    return pruned.map((x) => x.key);
-  } catch { return []; }
-}
-
-function _uniqueDeleteKeys(msgKeys) {
-  const seen = new Set();
-  const out = [];
-  for (const k of (msgKeys || [])) {
-    const id = k?.remoteJid ? (k.remoteJid + ':' + (k.participant || '') + ':' + (k.id || '')) : (k?.id || '');
-    const dedupeKey = id || JSON.stringify(k);
-    if (seen.has(dedupeKey)) continue;
-    seen.add(dedupeKey);
-    out.push(k);
-  }
-  return out;
-}
-
-function enqueueDeleteRetry(groupJid, msgKey, attempt = 1) {
-  try {
-    if (!groupJid || !msgKey) return;
-    if (attempt > DELETE_RETRY_MAX_ATTEMPTS) return;
-    const now = Date.now();
-    const id = groupJid + ':' + (msgKey.participant || '') + ':' + (msgKey.id || '');
-    if (deleteRetryQueue.some((x) => x && x.id === id)) return;
-    deleteRetryQueue.push({ id, groupJid, msgKey, attempt, firstTs: now, nextTs: now + Math.min(15000, 1200 * attempt) });
-    if (!deleteRetryTimer) deleteRetryTimer = setTimeout(() => drainDeleteRetryQueue().catch(() => {}), 800);
-  } catch {}
-}
-
-async function drainDeleteRetryQueue(safeDelete) {
-  const now = Date.now();
-  deleteRetryTimer = null;
-
-  deleteRetryQueue = (deleteRetryQueue || []).filter((x) => x && (now - (x.firstTs || now)) < DELETE_RETRY_MAX_AGE_MS && (x.attempt || 0) <= DELETE_RETRY_MAX_ATTEMPTS);
-  if (!deleteRetryQueue.length) return;
-
-  deleteRetryQueue.sort((a, b) => (a.nextTs || 0) - (b.nextTs || 0));
-  const ready = deleteRetryQueue.filter((x) => (x.nextTs || 0) <= now);
-  const pending = deleteRetryQueue.filter((x) => (x.nextTs || 0) > now);
-  deleteRetryQueue = pending;
-
-  const PAR = Math.max(1, Math.floor(DELETE_PARALLEL / 2));
-  for (let i = 0; i < ready.length; i += PAR) {
-    const slice = ready.slice(i, i + PAR);
-    const results = await Promise.allSettled(slice.map((it) => safeDelete(it.groupJid, it.msgKey, { source: "retry", attempt: it.attempt } )));
-    results.forEach((r, idx) => {
-      const it = slice[idx];
-      const ok = (r.status === 'fulfilled') && r.value === true;
-      if (!ok) enqueueDeleteRetry(it.groupJid, it.msgKey, (it.attempt || 1) + 1);
-    });
-    await new Promise(r => setTimeout(r, 120));
-  }
-
-  if (deleteRetryQueue.length) {
-    const nextIn = Math.max(400, Math.min(...deleteRetryQueue.map((x) => Math.max(0, (x.nextTs || 0) - Date.now()))));
-    deleteRetryTimer = setTimeout(() => drainDeleteRetryQueue(safeDelete).catch(() => {}), nextIn);
-  }
-}
-
-function enqueueBulkViolation(groupJid, senderJid, senderId, msgKeyOrKeys, reasons, strikeCount, options = {}) {
-  const key = groupJid + '-' + senderId;
-  const now = Date.now();
-
-  let rec = pendingActions.get(key);
-  if (!rec) {
-    rec = { groupJid, senderJid, senderId, msgKeys: [], reasons: new Map(), strikeCount: 0, forceRemove: false, timer: null, dueTs: 0, firstTs: now, lastTs: now, sampleText: "" };
-    pendingActions.set(key, rec);
-  }
-
-  rec.groupJid = groupJid;
-  rec.senderJid = senderJid;
-  rec.senderId = senderId;
-  rec.lastTs = now;
-
-  if (options.sampleText && !rec.sampleText) rec.sampleText = String(options.sampleText);
-
-  const keys = Array.isArray(msgKeyOrKeys) ? msgKeyOrKeys : (msgKeyOrKeys ? [msgKeyOrKeys] : []);
-  if (keys.length) rec.msgKeys.push(...keys);
-  for (const r of (reasons || [])) {
-    rec.reasons.set(r, (rec.reasons.get(r) || 0) + 1);
-  }
-
-  if (typeof strikeCount === 'number') rec.strikeCount = Math.max(rec.strikeCount, strikeCount);
-  if (options.forceRemove) rec.forceRemove = true;
-
-  const delay = Math.max(0, (typeof options.delayMs === 'number') ? options.delayMs : BULK_DELAY_MS);
-  const due = now + delay;
-
-  if (!rec.timer) {
-    rec.dueTs = due;
-    rec.timer = setTimeout(() => flushBulkViolation(key).catch(() => {}), Math.max(0, rec.dueTs - Date.now()));
-  } else {
-    if (!rec.dueTs) rec.dueTs = due;
-    if (due < rec.dueTs) {
-      clearTimeout(rec.timer);
-      rec.dueTs = due;
-      rec.timer = setTimeout(() => flushBulkViolation(key).catch(() => {}), Math.max(0, rec.dueTs - Date.now()));
-    }
-  }
-
-  if (DEBUG_MODE && options.debugTag) {
-    console.log("\ud83d\udccc enqueueBulkViolation", {
-      ts: _ts(),
-      debugTag: options.debugTag,
-      key,
-      senderJid,
-      senderId,
-      groupJid,
-      reasons,
-      strikeCount,
-      forceRemove: !!options.forceRemove,
-      delayMs: delay,
-      dueInMs: Math.max(0, due - Date.now()),
-      sample: _snip(rec.sampleText || options.sampleText || "")
-    });
-  }
-}
-
-let sockRef = null;
-
-async function flushBulkViolation(key) {
-  const rec = pendingActions.get(key);
-  if (!rec) return;
-  pendingActions.delete(key);
-  if (rec.timer) clearTimeout(rec.timer);
-  rec.timer = null;
-  rec.dueTs = 0;
-
-  const keys = _uniqueDeleteKeys(rec.msgKeys);
-
-  const safeDelete = sockRef?._safeDelete;
-  const safeRemove = sockRef?._safeRemove;
-
-  if (DEBUG_MODE) {
-    const reasonsObj = {};
-    for (const [r, c] of rec.reasons.entries()) reasonsObj[r] = c;
-    console.log('\ud83e\uddf9 Bulk action start:', {
-      ts: _ts(),
-      key,
-      groupJid: rec.groupJid,
-      senderJid: rec.senderJid,
-      senderId: rec.senderId,
-      deleteCount: keys.length,
-      strikeCount: rec.strikeCount,
-      forceRemove: rec.forceRemove,
-      reasons: reasonsObj,
-      ageMs: Date.now() - (rec.firstTs || Date.now()),
-      sample: _snip(rec.sampleText)
-    });
-  }
-
-  let okCount = 0;
-  let failCount = 0;
-
-  if (typeof safeDelete === 'function') {
-    for (let i = 0; i < keys.length; i += DELETE_PARALLEL) {
-      const slice = keys.slice(i, i + DELETE_PARALLEL);
-      const results = await Promise.allSettled(slice.map((k) => safeDelete(rec.groupJid, k, { source: "bulk" })));
-      results.forEach((r, idx) => {
-        const ok = (r.status === 'fulfilled') && r.value === true;
-        if (ok) okCount += 1;
-        else {
-          failCount += 1;
-          enqueueDeleteRetry(rec.groupJid, slice[idx], 1);
-        }
-      });
-    }
-  }
-
-  if (DEBUG_MODE) {
-    console.log('\ud83e\uddf9 Bulk action delete summary:', {
-      ts: _ts(),
-      key,
-      ok: okCount,
-      failed: failCount,
-      retryQueueLen: deleteRetryQueue.length,
-      notAdminCached: notAdminGroups.has(rec.groupJid)
-    });
-  }
-
-  if (deleteRetryQueue.length && !deleteRetryTimer && typeof safeDelete === 'function') {
-    deleteRetryTimer = setTimeout(() => drainDeleteRetryQueue(safeDelete).catch(() => {}), 800);
-  }
-
-  if ((rec.forceRemove || rec.strikeCount >= 3) && typeof safeRemove === 'function') {
-    await new Promise(r => setTimeout(r, 200));
-    const removed = await safeRemove(rec.groupJid, rec.senderJid);
-
-    if (DEBUG_MODE) {
-      console.log('\ud83d\udc62 Remove attempt:', {
-        ts: _ts(),
-        key,
-        groupJid: rec.groupJid,
-        senderJid: rec.senderJid,
-        removed: !!removed
-      });
-    }
-
-    if (removed) {
-      const userKey = rec.groupJid + '-' + rec.senderId;
-      userViolations.delete(userKey);
-      senderRate.delete(userKey);
-      senderRecentKeys.delete(userKey);
-      floodBanned.delete(userKey);
-    }
-  }
-}
-
 async function startBot() {
   try {
     restoreSessionFromEnv();
@@ -966,7 +770,7 @@ async function startBot() {
     const keyStore = makeCacheableSignalKeyStore(state.keys, createSilentLogger());
 
     const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log("\ud83d\udcf1 WA v" + version.join(".") + " (latest: " + isLatest + ")");
+    console.log("📱 WA v" + version.join(".") + " (latest: " + isLatest + ")");
 
     const sock = makeWASocket({
       version,
@@ -986,28 +790,28 @@ async function startBot() {
 
     if (!state.creds.registered) {
       console.log("");
-      console.log("\ud83d\udcf1 Requesting pairing code for: " + ADMIN_NUMBER);
-      console.log("\u23f3 Please wait...");
+      console.log("📱 Requesting pairing code for: " + ADMIN_NUMBER);
+      console.log("⏳ Please wait...");
       await new Promise(r => setTimeout(r, 3000));
       try {
         const code = await sock.requestPairingCode(ADMIN_NUMBER);
         console.log("");
-        console.log("\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557");
-        console.log("\u2551 \ud83d\udcf1 PAIRING CODE (Valid for 60 seconds) \u2551");
-        console.log("\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563");
-        console.log("\u2551                                        \u2551");
-        console.log("\u2551     " + code + "                         \u2551");
-        console.log("\u2551                                        \u2551");
-        console.log("\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563");
-        console.log("\u2551 1. Open WhatsApp on your phone         \u2551");
-        console.log("\u2551 2. Go to: Settings \u2192 Linked Devices    \u2551");
-        console.log("\u2551 3. Tap 'Link a Device'                 \u2551");
-        console.log("\u2551 4. Enter the 8-digit code above        \u2551");
-        console.log("\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d");
+        console.log("╔════════════════════════════════════════╗");
+        console.log("║ 📱 PAIRING CODE (Valid for 60 seconds) ║");
+        console.log("╠════════════════════════════════════════╣");
+        console.log("║                                        ║");
+        console.log("║     " + code + "                         ║");
+        console.log("║                                        ║");
+        console.log("╠════════════════════════════════════════╣");
+        console.log("║ 1. Open WhatsApp on your phone         ║");
+        console.log("║ 2. Go to: Settings → Linked Devices    ║");
+        console.log("║ 3. Tap 'Link a Device'                 ║");
+        console.log("║ 4. Enter the 8-digit code above        ║");
+        console.log("╚════════════════════════════════════════╝");
         console.log("");
       } catch (e) {
-        console.log("\u26a0\ufe0f Pairing code error:", e?.message);
-        console.log("\ud83d\udd04 Will retry in 10 seconds...");
+        console.log("⚠️ Pairing code error:", e?.message);
+        console.log("🔄 Will retry in 10 seconds...");
       }
     }
 
@@ -1026,19 +830,19 @@ async function startBot() {
         BOT_SELF_PHONE = extractPhoneNumber(BOT_SELF_JID);
 
         console.log("");
-        console.log("\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557");
-        console.log("\u2551 \u2705 ANTI-LINK BOT ONLINE                  \u2551");
-        console.log("\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563");
-        console.log("\u2551 \ud83e\udd16 Bot: " + (BOT_SELF_JID || "unknown").substring(0,30).padEnd(31) + "\u2551");
-        console.log("\u2551 \ud83d\udc51 Owner: " + String(ADMIN_NUMBER).padEnd(30) + "\u2551");
-        console.log("\u2551 \ud83d\udccb Mode: All groups                      \u2551");
-        console.log("\u2551 \ud83d\ude80 Hi/Lo queue + bulk moderation         \u2551");
-        console.log("\u2551 \ud83e\uddfe Diagnostic logs enabled               \u2551");
-        console.log("\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d");
+        console.log("╔══════════════════════════════════════════╗");
+        console.log("║ ✅ ANTI-LINK BOT ONLINE                  ║");
+        console.log("╠══════════════════════════════════════════╣");
+        console.log("║ 🤖 Bot: " + (BOT_SELF_JID || "unknown").substring(0,30).padEnd(31) + "║");
+        console.log("║ 👑 Owner: " + String(ADMIN_NUMBER).padEnd(30) + "║");
+        console.log("║ 📋 Mode: All groups                      ║");
+        console.log("║ 🚀 Hi/Lo queue + bulk moderation         ║");
+        console.log("║ 🧾 Diagnostic logs enabled               ║");
+        console.log("╚══════════════════════════════════════════╝");
         console.log("");
 
         if (DEBUG_MODE) {
-          console.log("\ud83d\udd0e Debug owner match targets:");
+          console.log("🔎 Debug owner match targets:");
           console.log("- ADMIN_NUMBER: " + ADMIN_NUMBER);
           console.log("- BOT_SELF_JID: " + BOT_SELF_JID);
           console.log("- BOT_SELF_PHONE: " + BOT_SELF_PHONE);
@@ -1052,19 +856,20 @@ async function startBot() {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const reason = lastDisconnect?.error?.message || "unknown";
 
-        console.log("\ud83d\udd0c Connection closed: " + reason);
+        console.log("🔌 Connection closed: " + reason);
 
         if (statusCode === DisconnectReason.loggedOut) {
-          console.log("\u274c Logged out. Delete WHATSAPP_SESSION env var and redeploy.");
+          console.log("❌ Logged out. Delete WHATSAPP_SESSION env var and redeploy.");
           if (fs.existsSync(AUTH_FOLDER)) fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
         } else {
           const delay = hasConnectedBefore ? 5000 : 10000;
-          console.log("\ud83d\udd04 Reconnecting in " + (delay/1000) + " seconds...");
+          console.log("🔄 Reconnecting in " + (delay/1000) + " seconds...");
           setTimeout(() => startBot().catch(console.error), delay);
         }
       }
     });
 
+    // FIX: SafeDelete cache no longer permanently disables deletes after one transient failure.
     async function safeDelete(groupJid, msgKey, meta = {}) {
       const keyInfo = _msgKeyInfo(msgKey);
 
@@ -1079,7 +884,7 @@ async function startBot() {
 
         if (age < NOT_ADMIN_CACHE_TTL && (now - lastProbe) < PROBE_EVERY_MS) {
           if (DEBUG_MODE) {
-            console.log("\ud83e\uddf1 delete skipped (cached not-admin)", {
+            console.log("🧱 delete skipped (cached not-admin)", {
               ts: _ts(),
               groupJid,
               ageMs: age,
@@ -1093,7 +898,7 @@ async function startBot() {
         }
 
         safeDelete._lastProbeAt.set(groupJid, now);
-        if (DEBUG_MODE) console.log("\ud83d\udd01 delete re-probe despite notAdmin cache", { ts: _ts(), groupJid, ageMs: age, meta, msgKey: keyInfo });
+        if (DEBUG_MODE) console.log("🔁 delete re-probe despite notAdmin cache", { ts: _ts(), groupJid, ageMs: age, meta, msgKey: keyInfo });
       }
 
       const maxAttempts = 3;
@@ -1102,17 +907,17 @@ async function startBot() {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         if (delay) await new Promise(r => setTimeout(r, delay));
         try {
-          if (DEBUG_MODE) console.log("\ud83d\uddd1\ufe0f delete attempt", { ts: _ts(), groupJid, attempt, meta, msgKey: keyInfo });
+          if (DEBUG_MODE) console.log("🗑️ delete attempt", { ts: _ts(), groupJid, attempt, meta, msgKey: keyInfo });
           await sock.sendMessage(groupJid, { delete: msgKey });
           if (notAdminGroups.has(groupJid)) notAdminGroups.delete(groupJid);
-          if (DEBUG_MODE) console.log("\u2705 delete ok", { ts: _ts(), groupJid, meta, msgKey: keyInfo });
+          if (DEBUG_MODE) console.log("✅ delete ok", { ts: _ts(), groupJid, meta, msgKey: keyInfo });
           return true;
         } catch (e) {
           const errMsg = String(e?.message || e || "");
           const statusCode = e?.output?.statusCode || e?.statusCode || e?.status;
 
           if (DEBUG_MODE) {
-            console.log("\u274c delete failed", {
+            console.log("❌ delete failed", {
               ts: _ts(),
               groupJid,
               attempt,
@@ -1130,14 +935,14 @@ async function startBot() {
 
           if (statusCode === 403 || errMsg.includes("forbidden") || errMsg.includes("not-authorized")) {
             notAdminGroups.set(groupJid, Date.now());
-            console.log("\ud83d\udcdd Not admin in this group (or delete not permitted) - caching for 1 hour");
+            console.log("📝 Not admin in this group (or delete not permitted) - caching for 1 hour");
           }
 
           break;
         }
       }
 
-      if (DEBUG_MODE) console.log("\u274c delete gave up", { ts: _ts(), groupJid, meta, msgKey: keyInfo, notAdminCached: notAdminGroups.has(groupJid) });
+      if (DEBUG_MODE) console.log("❌ delete gave up", { ts: _ts(), groupJid, meta, msgKey: keyInfo, notAdminCached: notAdminGroups.has(groupJid) });
       return false;
     }
 
@@ -1146,21 +951,21 @@ async function startBot() {
         if (!userJid) return false;
 
         if (BOT_SELF_JID && String(userJid) === String(BOT_SELF_JID)) {
-          console.log("\ud83d\udee1\ufe0f Refused to remove bot self");
+          console.log("🛡️ Refused to remove bot self");
           return false;
         }
 
         if (jidMatchesNumber(userJid, ADMIN_NUMBER) || (BOT_SELF_PHONE && jidMatchesNumber(userJid, BOT_SELF_PHONE))) {
-          console.log("\ud83d\udee1\ufe0f Refused to remove owner/self");
+          console.log("🛡️ Refused to remove owner/self");
           return false;
         }
 
         await sock.groupParticipantsUpdate(groupJid, [userJid], "remove");
-        console.log("\u2705 User removed from group");
+        console.log("✅ User removed from group");
         if (notAdminGroups.has(groupJid)) notAdminGroups.delete(groupJid);
         return true;
       } catch (e) {
-        console.log("\u26a0\ufe0f Could not remove user:", e?.message);
+        console.log("⚠️ Could not remove user:", e?.message);
         return false;
       }
     }
@@ -1183,15 +988,15 @@ async function startBot() {
         const textLower = visibleText.toLowerCase();
 
         if (textLower === "!bot") {
-          console.log("\ud83d\udce8 !bot command from:", senderJid);
+          console.log("📨 !bot command from:", senderJid);
           try {
-            let responseText = "\u2705 ANTI-LINK BOT ACTIVE\n";
-            responseText += "\ud83d\udc51 Owner: " + ADMIN_NUMBER + "\n";
-            responseText += "\ud83d\udc83 We R \ud83c\udd97 Baby!! \ud83e\udd2b\n";
+            let responseText = "✅ ANTI-LINK BOT ACTIVE\n";
+            responseText += "👑 Owner: " + ADMIN_NUMBER + "\n";
+            responseText += "💃 We R 🆗 Baby!! 🤫\n";
             await sock.sendMessage(groupJid, { text: responseText });
-            console.log("\u2705 Sent !bot response");
+            console.log("✅ Sent !bot response");
           } catch (e) {
-            console.log("\u26a0\ufe0f Could not send !bot reply:", e?.message);
+            console.log("⚠️ Could not send !bot reply:", e?.message);
           }
           return;
         }
@@ -1210,7 +1015,7 @@ async function startBot() {
         );
 
         if (DEBUG_MODE) {
-          console.log("\ud83e\uddfe owner-check:", {
+          console.log("🧾 owner-check:", {
             senderJid,
             senderPhone,
             fromMe: !!msg.key.fromMe,
@@ -1228,15 +1033,19 @@ async function startBot() {
         }
 
         if (exempt || hardOwner) {
-          if (DEBUG_MODE) console.log("\ud83d\udc51 Exempt message - skipping checks");
+          if (DEBUG_MODE) console.log("👑 Exempt message - skipping checks");
           return;
         }
 
-        const earlyLink = detectLinks(visibleText);
+        // ===== Early link check result is used for both priority handling and later evaluation =====
+        // IMPORTANT: If something is "linkish" (e.g. contains www., wa.me, .com, etc), treat it as a link.
+        // This prevents misses under flood/obfuscation and matches your requirement.
+        const detectedLink = detectLinks(visibleText);
         const linkish = _looksLinkish(visibleText);
+        const earlyLink = detectedLink || linkish;
 
-        if (DEBUG_MODE && linkish && !earlyLink) {
-          console.log("\u26a0\ufe0f linkish-but-not-detected", {
+        if (DEBUG_MODE && linkish && !detectedLink) {
+          console.log("⚠️ linkish-treated-as-link", {
             ts: _ts(),
             senderJid,
             groupJid,
@@ -1244,6 +1053,7 @@ async function startBot() {
           });
         }
 
+        // ===== PRIORITY: EARLY LINK CHECK (fast path during floods) =====
         if (earlyLink) {
           const senderId0 = senderPhone || senderJid || ('unknown-' + (msg.key?.id || Date.now()));
           const rateKey0 = groupJid + '-' + senderId0;
@@ -1263,6 +1073,7 @@ async function startBot() {
           return;
         }
 
+        // ===== PRIORITY: SENDER-BASED FLOOD BAN (anti-spam + backcheck) =====
         const senderId = senderPhone || senderJid || ('unknown-' + (msg.key?.id || Date.now()));
         const rateKey = groupJid + '-' + senderId;
         const now = Date.now();
@@ -1288,7 +1099,7 @@ async function startBot() {
         if (pruned.length > FLOOD_MAX_MSG) {
           floodBanned.set(rateKey, now);
           userViolations.set(rateKey, 3);
-          console.log('\ud83d\udea8 FLOOD-BAN: ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
+          console.log('🚨 FLOOD-BAN: ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
           const backKeys = getRecentSenderKeys(rateKey);
           enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, {
             forceRemove: true,
@@ -1299,8 +1110,9 @@ async function startBot() {
           return;
         }
 
+        // ===== NOT OWNER - CHECK FOR VIOLATIONS =====
         const dup = checkDuplicate(groupJid, senderJid, visibleText);
-        const hasLink = false;
+        const hasLink = false; // earlyLink already handled above
         const hasPhone = detectPhoneNumbers(visibleText);
         const business = isBusinessPost(msg0);
         const apk = isAPKFile(msg0);
@@ -1315,7 +1127,7 @@ async function startBot() {
         if (DEBUG_MODE) {
           const shouldLogEval = linkish || hasPhone || keyword || buttons || contact || apk || zip || audio || business;
           if (shouldLogEval) {
-            console.log("\ud83e\uddea eval", {
+            console.log("🧪 eval", {
               ts: _ts(),
               groupJid,
               senderJid,
@@ -1358,7 +1170,7 @@ async function startBot() {
         userViolations.set(userKey, updated);
 
         console.log("");
-        console.log("\ud83d\udeab VIOLATION DETECTED");
+        console.log("🚫 VIOLATION DETECTED");
         console.log("User: " + senderJid);
         console.log("Group: " + groupJid);
         console.log("Reason: " + reasons.join(", "));
@@ -1373,7 +1185,7 @@ async function startBot() {
 
         console.log("");
       } catch (e) {
-        console.log("\u26a0\ufe0f Error:", e?.message);
+        console.log("⚠️ Error:", e?.message);
       }
     }
 
@@ -1382,6 +1194,7 @@ async function startBot() {
         if (!msg?.key?.remoteJid?.endsWith('@g.us')) continue;
         if (!msg.message) continue;
 
+        // Backcheck + PRIORITY flood-ban at ingest time (before queueing)
         try {
           const groupJid = msg.key.remoteJid;
           const senderJid = getSenderJidForMsg(msg) || msg.key.participant || msg.participant || '';
@@ -1408,7 +1221,7 @@ async function startBot() {
             if (pruned.length > FLOOD_MAX_MSG) {
               floodBanned.set(rateKey, now);
               userViolations.set(rateKey, 3);
-              console.log('\ud83d\udea8 FLOOD-BAN(ingest): ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
+              console.log('🚨 FLOOD-BAN(ingest): ' + senderJid + ' -> ' + pruned.length + ' msgs/' + FLOOD_WINDOW_MS + 'ms');
               const backKeys = getRecentSenderKeys(rateKey);
               enqueueBulkViolation(groupJid, senderJid, senderId, backKeys, ['flood(' + pruned.length + '/' + FLOOD_WINDOW_MS + 'ms)'], 3, { forceRemove: true, delayMs: 0, debugTag: "ingest-floodBan-trip" });
               continue;
@@ -1416,12 +1229,14 @@ async function startBot() {
           }
         } catch {}
 
+        // Link-priority enqueue
+        // IMPORTANT: if it looks link-ish, treat as link for priority.
         let hi = false;
         try {
           const __unwrapped = (typeof unwrapMessageContent === 'function') ? unwrapMessageContent(msg.message) : msg.message;
           const msg0 = (__unwrapped === msg.message) ? msg : { ...msg, message: __unwrapped };
           const t = extractVisibleText(msg0);
-          hi = !!(t && detectLinks(t));
+          hi = !!(t && (detectLinks(t) || _looksLinkish(t)));
         } catch { hi = false; }
 
         if (hi) incomingQueueHi.push(msg);
@@ -1448,6 +1263,7 @@ async function startBot() {
           for (let i = 0; i < batch.length; i += QUEUE_PARALLEL) {
             const slice = batch.slice(i, i + QUEUE_PARALLEL);
             await Promise.allSettled(slice.map(async (msg) => {
+              // Fast path: if already flood-banned, don't waste CPU
               try {
                 const groupJid = msg.key.remoteJid;
                 const senderJid = getSenderJidForMsg(msg) || msg.key.participant || msg.participant || '';
@@ -1466,6 +1282,7 @@ async function startBot() {
               return handleMessage(msg);
             }));
 
+            // Keep delete retries moving under load
             if (deleteRetryQueue.length && !deleteRetryTimer) {
               deleteRetryTimer = setTimeout(() => drainDeleteRetryQueue(safeDelete).catch(() => {}), 800);
             }
@@ -1489,11 +1306,11 @@ async function startBot() {
     });
 
     setInterval(cleanupCaches, 30000);
-    console.log("\ud83d\ude80 Bot initialized - waiting for connection...");
+    console.log("🚀 Bot initialized - waiting for connection...");
 
   } catch (e) {
-    console.log("\u274c Start error:", e.message);
-    console.log("\ud83d\udd04 Retrying in 30 seconds...");
+    console.log("❌ Start error:", e.message);
+    console.log("🔄 Retrying in 30 seconds...");
     setTimeout(() => startBot().catch(() => {}), 30000);
   }
 }
