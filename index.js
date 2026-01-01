@@ -278,7 +278,6 @@ function restoreSessionFromEnv() {
     }
 
     // If env session is known-invalid, do not attempt crypto decrypt repeatedly.
-    // We'll continue with pairing/local auth as applicable.
     if (SESSION_ENV_STATUS === 'invalid') {
       console.log("❌ WHATSAPP_SESSION env is invalid (" + (SESSION_ENV_REASON || 'unknown') + ") - skipping restore");
       console.log("🧩 Likely causes: (1) WHATSAPP_SESSION value is truncated/corrupted, or (2) SESSION_KEY changed since session was generated.");
@@ -315,9 +314,6 @@ function restoreSessionFromEnv() {
 
 function saveSessionToEnv() {
   try {
-    // Pair-once behavior:
-    // - If WHATSAPP_SESSION env is present AND decrypt validated it as "valid", do not print again.
-    // - If WHATSAPP_SESSION env is present BUT invalid/truncated, we DO print a fresh valid value once.
     const hasEnv = !!(process.env.WHATSAPP_SESSION && String(process.env.WHATSAPP_SESSION).trim().length > 40);
     if (hasEnv && SESSION_ENV_STATUS === 'valid') return;
 
@@ -394,9 +390,6 @@ function jidMatchesNumber(senderJid, phoneDigits) {
 }
 
 function isOwner(senderJid) {
-  // Deterministic owner check (phone-based):
-  // - ADMIN_NUMBER: your number
-  // - BOT_SELF_PHONE: the phone number of the WhatsApp account the bot is logged into
   if (jidMatchesNumber(senderJid, ADMIN_NUMBER)) return true;
   if (BOT_SELF_PHONE && jidMatchesNumber(senderJid, BOT_SELF_PHONE)) return true;
   return false;
@@ -417,7 +410,6 @@ function getSenderJidForMsg(msg) {
   try {
     if (!msg?.key) return "";
     const remote = String(msg.key.remoteJid || "");
-    // For group messages, ONLY msg.key.participant identifies the sender. Never fall back to the group JID.
     if (remote.endsWith("@g.us")) return String(msg.key.participant || "");
     return remote;
   } catch { return ""; }
@@ -429,9 +421,7 @@ function isSelfMessage(msg) {
 
   const sender = getSenderJidForMsg(msg) || msg.key.participant || (String(msg.key.remoteJid || '').endsWith('@g.us') ? '' : msg.key.remoteJid);
   if (BOT_SELF_JID && sender === BOT_SELF_JID) return true;
-
   if (BOT_SELF_PHONE && jidMatchesNumber(sender, BOT_SELF_PHONE)) return true;
-
   return false;
 }
 
@@ -440,7 +430,6 @@ function isExempt(msg) {
   if (msg.key.fromMe) return true;
 
   const senderJid = getSenderJidForMsg(msg);
-  // In groups, if participant is missing, treat as NOT exempt.
   if (!senderJid) return false;
 
   if (isOwnerLid(senderJid)) return true;
@@ -458,7 +447,6 @@ const LINK_DOTLIKE_REGEX = /[\u3002\uFF0E\uFF61\u2024\u2219\uFE52\u2027\u00B7\u0
 const LINK_SLASHLIKE_REGEX = /[\u2215\u2044\uFF0F]/g;
 const LINK_COLONLIKE_REGEX = /[\uFF1A]/g;
 
-// IMPORTANT: build these via RegExp constructor so copy/paste can't break startup.
 const LINK_BRACKET_DOT_REGEX = (() => {
   try { return new RegExp("[\\[\\(\\{]\\s*(?:\\.|dot)\\s*[\\]\\)\\}]", "gi"); }
   catch { return new RegExp("\\\\[\\\\s*(?:\\\\.|dot)\\\\s*\\\\]", "gi"); }
@@ -501,30 +489,23 @@ function _dehxxp(s) {
 function detectLinks(text) {
   if (!text) return false;
 
-  // Normalize obfuscation first
   const t0 = normalizeForLinkDetect(text);
   const lc0 = t0.toLowerCase();
-
-  // Ultra-fast fallback (no regex): catches cases like "www.google.com" even if regex got corrupted elsewhere.
   if (lc0.includes('http://') || lc0.includes('https://') || lc0.includes('www.')) return true;
 
   if (FAST_LINK_REGEX.test(t0)) return true;
 
-  // Fallback 1: spaced/line-broken links
   const t1 = _compactForLinkDetect(t0);
   const lc1 = t1.toLowerCase();
   if (lc1.includes('http://') || lc1.includes('https://') || lc1.includes('www.')) return true;
   if (t1 !== t0 && FAST_LINK_REGEX.test(t1)) return true;
 
-  // Fallback 2: remove brackets
   const t2 = _stripBrackets(t1);
   if (t2 !== t1 && FAST_LINK_REGEX.test(t2)) return true;
 
-  // Fallback 3: hxxp(s)
   const t3 = _dehxxp(t2);
   if (t3 !== t2 && FAST_LINK_REGEX.test(t3)) return true;
 
-  // Fallback 4: aggressive compact after dehxxp
   const t4 = _compactForLinkDetect(t3);
   if (t4 !== t3 && FAST_LINK_REGEX.test(t4)) return true;
 
@@ -762,6 +743,232 @@ function cleanupCaches() {
   }
 }
 
+function rememberSenderKey(rateKey, msgKey) {
+  try {
+    if (!rateKey || !msgKey) return;
+    const now = Date.now();
+    const arr = senderRecentKeys.get(rateKey) || [];
+    arr.push({ ts: now, key: msgKey });
+    if (arr.length > RECENT_KEY_MAX) arr.splice(0, arr.length - RECENT_KEY_MAX);
+    senderRecentKeys.set(rateKey, arr);
+  } catch {}
+}
+
+function getRecentSenderKeys(rateKey) {
+  try {
+    const now = Date.now();
+    const arr = senderRecentKeys.get(rateKey) || [];
+    const pruned = (arr || []).filter((x) => x && x.ts && (now - x.ts) < RECENT_KEY_TTL_MS);
+    if (pruned.length) senderRecentKeys.set(rateKey, pruned.slice(-RECENT_KEY_MAX));
+    else senderRecentKeys.delete(rateKey);
+    return pruned.map((x) => x.key);
+  } catch { return []; }
+}
+
+function _uniqueDeleteKeys(msgKeys) {
+  const seen = new Set();
+  const out = [];
+  for (const k of (msgKeys || [])) {
+    const id = k?.remoteJid ? (k.remoteJid + ':' + (k.participant || '') + ':' + (k.id || '')) : (k?.id || '');
+    const dedupeKey = id || JSON.stringify(k);
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(k);
+  }
+  return out;
+}
+
+function enqueueDeleteRetry(groupJid, msgKey, attempt = 1) {
+  try {
+    if (!groupJid || !msgKey) return;
+    if (attempt > DELETE_RETRY_MAX_ATTEMPTS) return;
+    const now = Date.now();
+    const id = groupJid + ':' + (msgKey.participant || '') + ':' + (msgKey.id || '');
+    if (deleteRetryQueue.some((x) => x && x.id === id)) return;
+    deleteRetryQueue.push({ id, groupJid, msgKey, attempt, firstTs: now, nextTs: now + Math.min(15000, 1200 * attempt) });
+    if (!deleteRetryTimer) deleteRetryTimer = setTimeout(() => drainDeleteRetryQueue().catch(() => {}), 800);
+  } catch {}
+}
+
+async function drainDeleteRetryQueue(safeDelete) {
+  const now = Date.now();
+  deleteRetryTimer = null;
+
+  deleteRetryQueue = (deleteRetryQueue || []).filter((x) => x && (now - (x.firstTs || now)) < DELETE_RETRY_MAX_AGE_MS && (x.attempt || 0) <= DELETE_RETRY_MAX_ATTEMPTS);
+  if (!deleteRetryQueue.length) return;
+
+  deleteRetryQueue.sort((a, b) => (a.nextTs || 0) - (b.nextTs || 0));
+  const ready = deleteRetryQueue.filter((x) => (x.nextTs || 0) <= now);
+  const pending = deleteRetryQueue.filter((x) => (x.nextTs || 0) > now);
+  deleteRetryQueue = pending;
+
+  const PAR = Math.max(1, Math.floor(DELETE_PARALLEL / 2));
+  for (let i = 0; i < ready.length; i += PAR) {
+    const slice = ready.slice(i, i + PAR);
+    const results = await Promise.allSettled(slice.map((it) => safeDelete(it.groupJid, it.msgKey, { source: "retry", attempt: it.attempt } )));
+    results.forEach((r, idx) => {
+      const it = slice[idx];
+      const ok = (r.status === 'fulfilled') && r.value === true;
+      if (!ok) enqueueDeleteRetry(it.groupJid, it.msgKey, (it.attempt || 1) + 1);
+    });
+    await new Promise(r => setTimeout(r, 120));
+  }
+
+  if (deleteRetryQueue.length) {
+    const nextIn = Math.max(400, Math.min(...deleteRetryQueue.map((x) => Math.max(0, (x.nextTs || 0) - Date.now()))));
+    deleteRetryTimer = setTimeout(() => drainDeleteRetryQueue(safeDelete).catch(() => {}), nextIn);
+  }
+}
+
+function enqueueBulkViolation(groupJid, senderJid, senderId, msgKeyOrKeys, reasons, strikeCount, options = {}) {
+  const key = groupJid + '-' + senderId;
+  const now = Date.now();
+
+  let rec = pendingActions.get(key);
+  if (!rec) {
+    rec = { groupJid, senderJid, senderId, msgKeys: [], reasons: new Map(), strikeCount: 0, forceRemove: false, timer: null, dueTs: 0, firstTs: now, lastTs: now, sampleText: "" };
+    pendingActions.set(key, rec);
+  }
+
+  rec.groupJid = groupJid;
+  rec.senderJid = senderJid;
+  rec.senderId = senderId;
+  rec.lastTs = now;
+
+  if (options.sampleText && !rec.sampleText) rec.sampleText = String(options.sampleText);
+
+  const keys = Array.isArray(msgKeyOrKeys) ? msgKeyOrKeys : (msgKeyOrKeys ? [msgKeyOrKeys] : []);
+  if (keys.length) rec.msgKeys.push(...keys);
+  for (const r of (reasons || [])) {
+    rec.reasons.set(r, (rec.reasons.get(r) || 0) + 1);
+  }
+
+  if (typeof strikeCount === 'number') rec.strikeCount = Math.max(rec.strikeCount, strikeCount);
+  if (options.forceRemove) rec.forceRemove = true;
+
+  const delay = Math.max(0, (typeof options.delayMs === 'number') ? options.delayMs : BULK_DELAY_MS);
+  const due = now + delay;
+
+  if (!rec.timer) {
+    rec.dueTs = due;
+    rec.timer = setTimeout(() => flushBulkViolation(key).catch(() => {}), Math.max(0, rec.dueTs - Date.now()));
+  } else {
+    if (!rec.dueTs) rec.dueTs = due;
+    if (due < rec.dueTs) {
+      clearTimeout(rec.timer);
+      rec.dueTs = due;
+      rec.timer = setTimeout(() => flushBulkViolation(key).catch(() => {}), Math.max(0, rec.dueTs - Date.now()));
+    }
+  }
+
+  if (DEBUG_MODE && options.debugTag) {
+    console.log("📌 enqueueBulkViolation", {
+      ts: _ts(),
+      debugTag: options.debugTag,
+      key,
+      senderJid,
+      senderId,
+      groupJid,
+      reasons,
+      strikeCount,
+      forceRemove: !!options.forceRemove,
+      delayMs: delay,
+      dueInMs: Math.max(0, due - Date.now()),
+      sample: _snip(rec.sampleText || options.sampleText || "")
+    });
+  }
+}
+
+let sockRef = null;
+
+async function flushBulkViolation(key) {
+  const rec = pendingActions.get(key);
+  if (!rec) return;
+  pendingActions.delete(key);
+  if (rec.timer) clearTimeout(rec.timer);
+  rec.timer = null;
+  rec.dueTs = 0;
+
+  const keys = _uniqueDeleteKeys(rec.msgKeys);
+
+  const safeDelete = sockRef?._safeDelete;
+  const safeRemove = sockRef?._safeRemove;
+
+  if (DEBUG_MODE) {
+    const reasonsObj = {};
+    for (const [r, c] of rec.reasons.entries()) reasonsObj[r] = c;
+    console.log('🧹 Bulk action start:', {
+      ts: _ts(),
+      key,
+      groupJid: rec.groupJid,
+      senderJid: rec.senderJid,
+      senderId: rec.senderId,
+      deleteCount: keys.length,
+      strikeCount: rec.strikeCount,
+      forceRemove: rec.forceRemove,
+      reasons: reasonsObj,
+      ageMs: Date.now() - (rec.firstTs || Date.now()),
+      sample: _snip(rec.sampleText)
+    });
+  }
+
+  let okCount = 0;
+  let failCount = 0;
+
+  if (typeof safeDelete === 'function') {
+    for (let i = 0; i < keys.length; i += DELETE_PARALLEL) {
+      const slice = keys.slice(i, i + DELETE_PARALLEL);
+      const results = await Promise.allSettled(slice.map((k) => safeDelete(rec.groupJid, k, { source: "bulk" })));
+      results.forEach((r, idx) => {
+        const ok = (r.status === 'fulfilled') && r.value === true;
+        if (ok) okCount += 1;
+        else {
+          failCount += 1;
+          enqueueDeleteRetry(rec.groupJid, slice[idx], 1);
+        }
+      });
+    }
+  }
+
+  if (DEBUG_MODE) {
+    console.log('🧹 Bulk action delete summary:', {
+      ts: _ts(),
+      key,
+      ok: okCount,
+      failed: failCount,
+      retryQueueLen: deleteRetryQueue.length,
+      notAdminCached: notAdminGroups.has(rec.groupJid)
+    });
+  }
+
+  if (deleteRetryQueue.length && !deleteRetryTimer && typeof safeDelete === 'function') {
+    deleteRetryTimer = setTimeout(() => drainDeleteRetryQueue(safeDelete).catch(() => {}), 800);
+  }
+
+  if ((rec.forceRemove || rec.strikeCount >= 3) && typeof safeRemove === 'function') {
+    await new Promise(r => setTimeout(r, 200));
+    const removed = await safeRemove(rec.groupJid, rec.senderJid);
+
+    if (DEBUG_MODE) {
+      console.log('👢 Remove attempt:', {
+        ts: _ts(),
+        key,
+        groupJid: rec.groupJid,
+        senderJid: rec.senderJid,
+        removed: !!removed
+      });
+    }
+
+    if (removed) {
+      const userKey = rec.groupJid + '-' + rec.senderId;
+      userViolations.delete(userKey);
+      senderRate.delete(userKey);
+      senderRecentKeys.delete(userKey);
+      floodBanned.delete(userKey);
+    }
+  }
+}
+
 async function startBot() {
   try {
     restoreSessionFromEnv();
@@ -869,7 +1076,6 @@ async function startBot() {
       }
     });
 
-    // FIX: SafeDelete cache no longer permanently disables deletes after one transient failure.
     async function safeDelete(groupJid, msgKey, meta = {}) {
       const keyInfo = _msgKeyInfo(msgKey);
 
@@ -1037,9 +1243,6 @@ async function startBot() {
           return;
         }
 
-        // ===== Early link check result is used for both priority handling and later evaluation =====
-        // IMPORTANT: If something is "linkish" (e.g. contains www., wa.me, .com, etc), treat it as a link.
-        // This prevents misses under flood/obfuscation and matches your requirement.
         const detectedLink = detectLinks(visibleText);
         const linkish = _looksLinkish(visibleText);
         const earlyLink = detectedLink || linkish;
@@ -1053,7 +1256,6 @@ async function startBot() {
           });
         }
 
-        // ===== PRIORITY: EARLY LINK CHECK (fast path during floods) =====
         if (earlyLink) {
           const senderId0 = senderPhone || senderJid || ('unknown-' + (msg.key?.id || Date.now()));
           const rateKey0 = groupJid + '-' + senderId0;
@@ -1073,7 +1275,6 @@ async function startBot() {
           return;
         }
 
-        // ===== PRIORITY: SENDER-BASED FLOOD BAN (anti-spam + backcheck) =====
         const senderId = senderPhone || senderJid || ('unknown-' + (msg.key?.id || Date.now()));
         const rateKey = groupJid + '-' + senderId;
         const now = Date.now();
@@ -1110,9 +1311,8 @@ async function startBot() {
           return;
         }
 
-        // ===== NOT OWNER - CHECK FOR VIOLATIONS =====
         const dup = checkDuplicate(groupJid, senderJid, visibleText);
-        const hasLink = false; // earlyLink already handled above
+        const hasLink = false;
         const hasPhone = detectPhoneNumbers(visibleText);
         const business = isBusinessPost(msg0);
         const apk = isAPKFile(msg0);
@@ -1194,7 +1394,6 @@ async function startBot() {
         if (!msg?.key?.remoteJid?.endsWith('@g.us')) continue;
         if (!msg.message) continue;
 
-        // Backcheck + PRIORITY flood-ban at ingest time (before queueing)
         try {
           const groupJid = msg.key.remoteJid;
           const senderJid = getSenderJidForMsg(msg) || msg.key.participant || msg.participant || '';
@@ -1229,8 +1428,6 @@ async function startBot() {
           }
         } catch {}
 
-        // Link-priority enqueue
-        // IMPORTANT: if it looks link-ish, treat as link for priority.
         let hi = false;
         try {
           const __unwrapped = (typeof unwrapMessageContent === 'function') ? unwrapMessageContent(msg.message) : msg.message;
@@ -1263,7 +1460,6 @@ async function startBot() {
           for (let i = 0; i < batch.length; i += QUEUE_PARALLEL) {
             const slice = batch.slice(i, i + QUEUE_PARALLEL);
             await Promise.allSettled(slice.map(async (msg) => {
-              // Fast path: if already flood-banned, don't waste CPU
               try {
                 const groupJid = msg.key.remoteJid;
                 const senderJid = getSenderJidForMsg(msg) || msg.key.participant || msg.participant || '';
@@ -1282,7 +1478,6 @@ async function startBot() {
               return handleMessage(msg);
             }));
 
-            // Keep delete retries moving under load
             if (deleteRetryQueue.length && !deleteRetryTimer) {
               deleteRetryTimer = setTimeout(() => drainDeleteRetryQueue(safeDelete).catch(() => {}), 800);
             }
